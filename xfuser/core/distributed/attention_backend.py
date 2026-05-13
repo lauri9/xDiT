@@ -4,6 +4,7 @@ import inspect
 import math
 import torch.nn.functional as F
 from enum import Enum
+from typing import Optional
 from xfuser.envs import PACKAGES_CHECKER, environment_variables
 from xfuser.core.distributed.ssta import (
     setup_ssta,
@@ -314,6 +315,71 @@ if env_info["has_aiter"]:
             fav3_sage_mxfp4_wrapper,
             get_sage_fwd_configs_mxfp4,
         )
+
+        # Opaque op boundary around AITER's MXFP4 SageAttention V2 wrapper.
+        # Wrapping the wrapper as a torch.library.custom_op prevents Inductor
+        # from fusing the upstream attention-processor layout ops
+        # (cat / split_with_sizes / slice / transpose) and the USP all-to-all
+        # reshape chain into the wrapper's internal pre-quant reductions
+        # (V abs.amax for the FP8 V scale, K mean for SageAttention smoothing).
+        # That fusion produced large `triton_red_fused_*` kernels with strided
+        # reduction reads on gfx950 after AITER PR #2688 removed the implicit
+        # graph break in `arch_info.get_arch()`. With this boundary, Dynamo
+        # still emits a single CompiledFxGraph (no graph break, so PR #2688's
+        # CPU-side savings are preserved on lean processors like Wan), while
+        # Inductor compiles the xDiT side and the AITER side as two separate
+        # scheduling units.
+        @torch.library.custom_op("xfuser::aiter_sage_mxfp4_attn", mutates_args=())
+        def _aiter_sage_mxfp4_attn_op(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            causal: bool,
+            layout: str,
+            hadamard_rotation: bool,
+            R: Optional[torch.Tensor],
+            block_r: int,
+            block_m: Optional[int] = None,
+            block_n: Optional[int] = None,
+            kv_block_indices: Optional[torch.Tensor] = None,
+            lut_start: Optional[torch.Tensor] = None,
+            lut_count: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            block_lut = None
+            if kv_block_indices is not None:
+                block_lut = (kv_block_indices, lut_start, lut_count)
+
+            # SSTA paths override BLOCK_M/BLOCK_N; everyone else uses the
+            # default config the wrapper resolves internally when config=None.
+            config = None
+            if block_m is not None and block_n is not None:
+                config = get_sage_fwd_configs_mxfp4()
+                config["BLOCK_M"] = block_m
+                config["BLOCK_N"] = block_n
+
+            return fav3_sage_mxfp4_wrapper(
+                q, k, v,
+                causal=causal,
+                layout=layout,
+                hadamard_rotation=hadamard_rotation,
+                R=R,
+                BLOCK_R=block_r,
+                block_lut=block_lut,
+                config=config,
+            )
+
+        @_aiter_sage_mxfp4_attn_op.register_fake
+        def _(q, k, v, causal, layout, hadamard_rotation, R, block_r,
+              block_m=None, block_n=None,
+              kv_block_indices=None, lut_start=None, lut_count=None):
+            # Mirrors the allocation in fav3_sage_mxfp4_func:
+            #   out = torch.zeros((q.shape[0], q.shape[1], q.shape[2], v.shape[-1]),
+            #                     dtype=torch.bfloat16, device=q.device)
+            # which is correct for both BHSD ([b,h,s,d_v]) and BSHD ([b,s,h,d_v]).
+            return q.new_empty(
+                (q.shape[0], q.shape[1], q.shape[2], v.shape[-1]),
+                dtype=torch.bfloat16,
+            )
     except ImportError:
         pass # Error is rasied in runtime_state.py if AITER_SAGE_V2 is not available.
     try:
@@ -763,16 +829,21 @@ def _aiter_sage_attn_call(query, key, value, dropout_p, is_causal, attention_kwa
 
 @register_attention_function(AttentionBackendType.AITER_SAGE_V2)
 def _aiter_sage_v2_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    # Contiguous is needed for Sage v2 in older AITER versions. 
+    # Contiguous is needed for Sage v2 in older AITER versions.
     # This has been fixed in newer version of AITER, meaning the
     # contiguous calls can be removed in the future.
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
-    softmax_lse = None
-    attn_fn = functools.partial(fav3_sage_mxfp4_wrapper, layout="bhsd", hadamard_rotation=True, R=HADAMARD_MATRIX[query.device])
-    output = attn_fn(query, key, value, causal=is_causal)
-    return output, softmax_lse
+    output = _aiter_sage_mxfp4_attn_op(
+        query, key, value,
+        causal=is_causal,
+        layout="bhsd",
+        hadamard_rotation=True,
+        R=HADAMARD_MATRIX[query.device],
+        block_r=AITER_SAGE_V2_BLOCK_R,
+    )
+    return output, None
 
 
 @register_attention_function(AttentionBackendType.SAGE)
@@ -833,16 +904,24 @@ def _aiter_sparse_sage_attn_call(query, key, value, dropout_p, is_causal, attent
 def _aiter_sparse_sage_v2_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     attention_kwargs["sp_size"] = get_ulysses_parallel_world_size()
     block_size = math.prod(attention_kwargs["tile_size"])
-    config = get_sage_fwd_configs_mxfp4()
-    config["BLOCK_M"] = _TRITON_SSTA_BLOCK_SIZE
-    config["BLOCK_N"] = _TRITON_SSTA_BLOCK_SIZE
-    attn_fn = functools.partial(fav3_sage_mxfp4_wrapper, layout="bhsd", hadamard_rotation=True, R=HADAMARD_MATRIX[query.device], config=config)
     q, k, v, mask_config, ssta_state = setup_ssta(query, key, value, attention_kwargs)
     block_mask = get_sparse_mask(mask_config, sparse_type=attention_kwargs["attn_sparse_type"])
     if block_size != _TRITON_SSTA_BLOCK_SIZE:
         block_mask = expand_block_mask(block_mask, factor=block_size // _TRITON_SSTA_BLOCK_SIZE)
-    block_lut = block_attn_mask_to_ragged_lut(block_mask, num_heads=q.shape[1])
-    output = attn_fn(q, k, v, causal=is_causal, block_lut=block_lut)
+    kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(block_mask, num_heads=q.shape[1])
+    output = _aiter_sage_mxfp4_attn_op(
+        q, k, v,
+        causal=is_causal,
+        layout="bhsd",
+        hadamard_rotation=True,
+        R=HADAMARD_MATRIX[query.device],
+        block_r=AITER_SAGE_V2_BLOCK_R,
+        block_m=_TRITON_SSTA_BLOCK_SIZE,
+        block_n=_TRITON_SSTA_BLOCK_SIZE,
+        kv_block_indices=kv_block_indices,
+        lut_start=lut_start,
+        lut_count=lut_count,
+    )
     output = untile_ssta_output(output, ssta_state, attention_kwargs["encoder_sequence_length"], attention_kwargs["sp_size"])
     return output, None
 
@@ -935,10 +1014,16 @@ def _aiter_sparge_v2_attn_call(query, key, value, dropout_p, is_causal, attentio
     value = value.contiguous()
     config = get_sage_fwd_configs_mxfp4()
     q, k, v, state, block_mask, num_heads = _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, config)
-    block_lut = block_attn_mask_to_ragged_lut(block_mask, num_heads=num_heads)
-    output = fav3_sage_mxfp4_wrapper(
-        q, k, v, causal=is_causal, block_lut=block_lut,
-        layout="bhsd", hadamard_rotation=True,
-        R=HADAMARD_MATRIX[query.device], config=config,
+    kv_block_indices, lut_start, lut_count = block_attn_mask_to_ragged_lut(block_mask, num_heads=num_heads)
+    output = _aiter_sage_mxfp4_attn_op(
+        q, k, v,
+        causal=is_causal,
+        layout="bhsd",
+        hadamard_rotation=True,
+        R=HADAMARD_MATRIX[query.device],
+        block_r=AITER_SAGE_V2_BLOCK_R,
+        kv_block_indices=kv_block_indices,
+        lut_start=lut_start,
+        lut_count=lut_count,
     )
     return restore_sparge_output(output, state), None
