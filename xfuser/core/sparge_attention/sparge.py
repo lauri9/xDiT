@@ -153,19 +153,17 @@ def setup_sparge(
     static_mask: Optional[torch.Tensor] = None
     sp_pad_len = 0
 
-    # Both reorder and the static mask operate on the spatial (thw) layout,
-    # so they both need thw and they both need SP padding to be stripped
-    # off so the block grid lines up with the (t, h, w) cuboid.
-    if use_static_block_mask and thw is None:
+    # Static mask is defined in Gilbert-permuted block space; meaningless
+    # without reorder. Match upstream's invariant and silently drop it.
+    if use_static_block_mask and not reorder_sequence:
         use_static_block_mask = False
 
-    if reorder_sequence and thw is None:
-        raise ValueError(
-            "Sparge with reorder_sequence=True requires "
-            "`attention_kwargs['thw']` to be published by the model wrapper."
-        )
-
-    if thw is not None and (reorder_sequence or use_static_block_mask):
+    if reorder_sequence:
+        if thw is None:
+            raise ValueError(
+                "Sparge with reorder_sequence=True requires "
+                "`attention_kwargs['thw']` to be published by the model wrapper."
+            )
         spatial_len = thw[0] * thw[1] * thw[2]
         sp_pad_len = image_len_post_deint - spatial_len
         if sp_pad_len < 0:
@@ -175,8 +173,6 @@ def setup_sparge(
                 f"({spatial_len}). Mismatch between attention_kwargs['thw'] "
                 f"and the input sequence."
             )
-
-    if reorder_sequence:
         fwd_perm, inv_perm = get_gilbert_perm(thw, query.device)
         if use_static_block_mask:
             static_mask = get_static_block_neighbor_mask(
@@ -214,26 +210,6 @@ def setup_sparge(
         image_q = image_q.index_select(dim=2, index=fwd_perm)
         image_k = image_k.index_select(dim=2, index=fwd_perm)
         image_v = image_v.index_select(dim=2, index=fwd_perm)
-
-    _a, _b = block_m, block_n
-    while _b:
-        _a, _b = _b, _a % _b
-    align = block_m * block_n // _a
-    image_len = image_q.shape[2]
-    need_image_pad = pad_block_divisible or text_len_post_deint > 0
-    img_pad = (-image_len) % align if need_image_pad else 0
-    if img_pad > 0:
-        image_q = F.pad(image_q, (0, 0, 0, img_pad))
-        image_k = F.pad(image_k, (0, 0, 0, img_pad))
-        image_v = F.pad(image_v, (0, 0, 0, img_pad))
-        if static_mask is not None:
-            n_iq = (image_len + img_pad) // block_m
-            n_ik = (image_len + img_pad) // block_n
-            padded_static = torch.zeros(
-                (n_iq, n_ik), dtype=static_mask.dtype, device=static_mask.device
-            )
-            padded_static[: static_mask.shape[0], : static_mask.shape[1]] = static_mask
-            static_mask = padded_static
 
     # Re-concatenate text tail.
     if text_q is not None:
