@@ -153,17 +153,19 @@ def setup_sparge(
     static_mask: Optional[torch.Tensor] = None
     sp_pad_len = 0
 
-    # Static mask is defined in Gilbert-permuted block space; meaningless
-    # without reorder. Match upstream's invariant and silently drop it.
-    if use_static_block_mask and not reorder_sequence:
+    # Both reorder and the static mask operate on the spatial (thw) layout,
+    # so they both need thw and they both need SP padding to be stripped
+    # off so the block grid lines up with the (t, h, w) cuboid.
+    if use_static_block_mask and thw is None:
         use_static_block_mask = False
 
-    if reorder_sequence:
-        if thw is None:
-            raise ValueError(
-                "Sparge with reorder_sequence=True requires "
-                "`attention_kwargs['thw']` to be published by the model wrapper."
-            )
+    if reorder_sequence and thw is None:
+        raise ValueError(
+            "Sparge with reorder_sequence=True requires "
+            "`attention_kwargs['thw']` to be published by the model wrapper."
+        )
+
+    if thw is not None and (reorder_sequence or use_static_block_mask):
         spatial_len = thw[0] * thw[1] * thw[2]
         sp_pad_len = image_len_post_deint - spatial_len
         if sp_pad_len < 0:
@@ -173,6 +175,8 @@ def setup_sparge(
                 f"({spatial_len}). Mismatch between attention_kwargs['thw'] "
                 f"and the input sequence."
             )
+
+    if reorder_sequence:
         fwd_perm, inv_perm = get_gilbert_perm(thw, query.device)
         if use_static_block_mask:
             static_mask = get_static_block_neighbor_mask(
