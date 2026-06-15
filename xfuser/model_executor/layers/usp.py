@@ -28,6 +28,8 @@ from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.attention_backend import (
     ATTENTION_FUNCTION_REGISTRY,
     AttentionBackendType,
+    FP8_HADAMARD_MATRIX,
+    _fp8_hadamard_rotate,
 )
 from xfuser.core.sparge_attention import head_balance
 
@@ -353,6 +355,12 @@ def USP(
                     runtime_state.fp8_a2a_scale, dtype=torch.float32, device=query.device
                 )
             scale_t = runtime_state.fp8_a2a_scale_tensor
+
+            # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
+            R = FP8_HADAMARD_MATRIX[query.device]
+            query = _fp8_hadamard_rotate(query, R).contiguous()
+            key = _fp8_hadamard_rotate(key, R).contiguous()
+
             q_fp8, q_descale = _per_tensor_quant(query, scale_t)
             query = _ft_c_input_all_to_all(q_fp8)
             k_fp8, k_descale = _per_tensor_quant(key, scale_t)
