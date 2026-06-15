@@ -69,6 +69,7 @@ class RuntimeConfig:
     spargeattn_simthreshold: float = 0.3
     spargeattn_cdfthreshold: float = 0.92
     use_spargeattn_head_balance: bool = False
+    fp8_a2a_scale: Optional[float] = None
 
     def __post_init__(self):
         check_packages()

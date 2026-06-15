@@ -60,6 +60,8 @@ def set_random_seed(seed: int):
 class RuntimeState(metaclass=ABCMeta):
     attention_backend: AttentionBackendType = AttentionBackendType.SDPA_FLASH
     cross_attention_backend: Optional[AttentionBackendType] = None
+    fp8_a2a_scale: Optional[float] = None
+    fp8_a2a_scale_tensor: Optional[torch.Tensor] = None
     parallel_config: ParallelConfig
     runtime_config: RuntimeConfig
     input_config: InputConfig
@@ -78,6 +80,7 @@ class RuntimeState(metaclass=ABCMeta):
         self.set_attention_backend(attention_backend)
         cross_attention_backend = self._select_cross_attention_backend(config)
         self.set_cross_attention_backend(cross_attention_backend)
+        self._init_fp8_a2a_scale(config)
 
     def is_ready(self):
         return self.ready
@@ -128,6 +131,23 @@ class RuntimeState(metaclass=ABCMeta):
         if attention_backend in [AttentionBackendType.FLASH_3_FP8, AttentionBackendType.AITER_FP8, AttentionBackendType.NVTE_FP8, AttentionBackendType.FLASH_4_FP4, AttentionBackendType.AITER_MLA]:
             logger.warning("Low-precision attention backend is enabled. This may cause poor quality outputs, consider using hybrid attention if possible.")
 
+
+    def _init_fp8_a2a_scale(self, config: EngineConfig):
+        scale = config.runtime_config.fp8_a2a_scale
+        if scale is None:
+            self.fp8_a2a_scale = None
+            return
+        ulysses_degree = config.parallel_config.sp_config.ulysses_degree or 1
+        if ulysses_degree <= 1:
+            logger.warning(
+                "--fp8_a2a_scale is set but ulysses_degree <= 1. "
+                "FP8 all-to-all will not be applied."
+            )
+            self.fp8_a2a_scale = None
+        else:
+            logger.warning(f"FP8 all-to-all enabled with static scale {scale}.")
+            self.fp8_a2a_scale = scale
+            self.fp8_a2a_scale_tensor = None  # created on first forward pass when device is known
 
     def set_cross_attention_backend(self, cross_attention_backend: Optional[str | AttentionBackendType]):
         """
