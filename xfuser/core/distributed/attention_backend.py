@@ -694,11 +694,6 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
-    # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
-    R = FP8_HADAMARD_MATRIX[query.device]
-    query = _fp8_hadamard_rotate(query, R).contiguous()
-    key = _fp8_hadamard_rotate(key, R).contiguous()
-
     softmax_lse = None
 
     if pre_quantized:
@@ -711,6 +706,11 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
             "v_descale": attention_kwargs["v_descale"],
         }
     else:
+        # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
+        R = FP8_HADAMARD_MATRIX[query.device]
+        query = _fp8_hadamard_rotate(query, R).contiguous()
+        key = _fp8_hadamard_rotate(key, R).contiguous()
+
         quant_dtype = aiter.dtypes.fp8
         dtypeMax = torch.finfo(quant_dtype).max
         if AITER_FP8_HAS_DESCALE:
