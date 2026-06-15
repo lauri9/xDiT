@@ -367,6 +367,12 @@ def USP(
                 "k_descale": k_descale,
                 "v_descale": v_descale,
             }
+            hb_attention_kwargs = (hb_attention_kwargs or {}) | {
+                "pre_quantized": True,
+                "q_descale": q_descale,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
+            }
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)
         else:
