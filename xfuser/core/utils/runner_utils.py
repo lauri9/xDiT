@@ -299,7 +299,16 @@ def rgetattr(obj: object, attr: str) -> object:
     """ Recursive getattr to get nested attributes """
     return functools.reduce(getattr, [obj] + attr.split("."))
 
-def quantize_linear_layers_to_fp4(model, parent_name='', fp8_layers=None, use_hybrid_schedule: bool = False, device: Optional[torch.device] = None):
+def quantize_linear_layers_to_fp4(
+    model,
+    parent_name='',
+    fp8_layers=None,
+    use_hybrid_schedule: bool = False,
+    device: Optional[torch.device] = None,
+    *,
+    use_hadamard: Optional[bool] = None,
+    hadamard_block_r: Optional[int] = None,
+):
     from torchao.quantization.granularity import PerTensor
     from torchao.quantization.quant_api import Float8DynamicActivationFloat8WeightConfig, quantize_
     from xfuser.model_executor.layers.mxfp4_linear import xFuserMXFP4Linear, xFuserHybridMXFP4Linear
@@ -324,7 +333,10 @@ def quantize_linear_layers_to_fp4(model, parent_name='', fp8_layers=None, use_hy
                     module.out_features,
                     bias=(module.bias is not None),
                     device=module.weight.device,
-                    dtype=module.weight.dtype
+                    dtype=module.weight.dtype,
+                    use_hadamard=use_hadamard,
+                    hadamard_block_r=hadamard_block_r,
+                    layer_name=full_name,
                 )
 
                 with torch.no_grad():
@@ -361,7 +373,15 @@ def quantize_linear_layers_to_fp4(model, parent_name='', fp8_layers=None, use_hy
                 setattr(model, name, new_layer)
 
         elif len(list(module.children())) > 0:
-            quantize_linear_layers_to_fp4(module, full_name, fp8_layers=fp8_layers, use_hybrid_schedule=use_hybrid_schedule, device=device)
+            quantize_linear_layers_to_fp4(
+                module,
+                full_name,
+                fp8_layers=fp8_layers,
+                use_hybrid_schedule=use_hybrid_schedule,
+                device=device,
+                use_hadamard=use_hadamard,
+                hadamard_block_r=hadamard_block_r,
+            )
 
 
 def quantize_linear_layers_to_nvfp4(

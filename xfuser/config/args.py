@@ -1,6 +1,7 @@
 import sys
 import argparse
 import dataclasses
+import os
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Union
 
@@ -162,6 +163,11 @@ class xFuserArgs:
     use_hybrid_gemm_schedule: bool = False
     num_hybrid_gemm_high_precision_steps: Optional[int] = None
     hybrid_gemm_schedule: Optional[str] = None
+    # MXFP4 GEMM Hadamard / diagnostics (opt-in; defaults preserve legacy behavior)
+    mxfp4_hadamard: bool = False
+    mxfp4_hadamard_block_r: int = 32
+    mxfp4_log_activation_stats: bool = False
+    mxfp4_log_activation_stats_output: Optional[str] = None
     # SSTA arguments
     use_ssta_sparse_text_to_image: Optional[bool] = False
     # Sparge attention
@@ -604,6 +610,28 @@ class xFuserArgs:
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
         )
+        parser.add_argument(
+            "--mxfp4_hadamard",
+            action="store_true",
+            help="Enable block-diagonal Hadamard smoothing for AITER MXFP4 linear GEMMs.",
+        )
+        parser.add_argument(
+            "--mxfp4_hadamard_block_r",
+            type=int,
+            default=32,
+            help="Hadamard block size for MXFP4 GEMMs (16, 32, 64, or 128; default 32).",
+        )
+        parser.add_argument(
+            "--mxfp4_log_activation_stats",
+            action="store_true",
+            help="Log MXFP4 activation distribution stats before/after Hadamard rotation.",
+        )
+        parser.add_argument(
+            "--mxfp4_log_activation_stats_output",
+            type=str,
+            default=None,
+            help="Optional CSV path for MXFP4 activation stats (rank 0 only).",
+        )
 
         parser.add_argument(
             "--num_iterations",
@@ -808,9 +836,22 @@ class xFuserArgs:
         return engine_args
 
 
+    def _apply_mxfp4_env_overrides(self) -> None:
+        if self.mxfp4_hadamard:
+            os.environ["XFUSER_AITER_MXFP4_HADAMARD"] = "1"
+        if self.mxfp4_hadamard_block_r is not None:
+            os.environ["XFUSER_AITER_MXFP4_BLOCK_R"] = str(self.mxfp4_hadamard_block_r)
+        if self.mxfp4_log_activation_stats:
+            os.environ["XFUSER_MXFP4_LOG_ACTIVATION_STATS"] = "1"
+        if self.mxfp4_log_activation_stats_output:
+            os.environ["XFUSER_MXFP4_LOG_ACTIVATION_STATS_OUTPUT"] = (
+                self.mxfp4_log_activation_stats_output
+            )
+
     def create_config(
         self,
     ) -> Tuple[EngineConfig, InputConfig]:
+        self._apply_mxfp4_env_overrides()
         if not self.use_ray and not torch.distributed.is_initialized():
             logger.warning(
                 "Distributed environment is not initialized. " "Initializing..."

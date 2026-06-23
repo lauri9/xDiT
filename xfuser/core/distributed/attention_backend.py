@@ -12,6 +12,11 @@ from xfuser.core.distributed.ssta import (
     expand_block_mask,
 )
 from xfuser.core.distributed import get_ulysses_parallel_world_size
+from xfuser.core.quant.hadamard import (
+    build_hadamard_matrix,
+    build_per_device_hadamard_matrix,
+    hadamard_rotate,
+)
 from xfuser.core.sparge_attention.sparge import (
     setup_sparge,
     compute_sparge_block_mask,
@@ -55,66 +60,14 @@ def _check_aiter_fp8_has_descale():
     return AITER_FP8_HAS_DESCALE
 
 def _aiter_sage_v2_hadamard_matrix(block_r):
-    hadamard_matrix = {}
-    try:
-        try:
-            from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
-                create_hadamard_matrix,
-            )
-        except ImportError:
-            from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
-        # Create the hadamard_matrix and replicate it on each available GPU
-        _hadamard = create_hadamard_matrix(block_r, dtype=torch.bfloat16) / (block_r ** 0.5)
-    except ImportError:
-        # If create_hadamard_matrix is not available, set the hadamard_matrix to None.
-        _hadamard = None
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            device = torch.device(f"cuda:{i}")
-            hadamard_matrix[device] = _hadamard.to(device) if _hadamard is not None else None
-    else:
-        # Fallback to CPU
-        device = torch.device("cpu")
-        hadamard_matrix[device] = _hadamard.to(device) if _hadamard is not None else None
-    return hadamard_matrix
-
-
-def _build_hadamard_matrix(block_r, dtype=torch.bfloat16):
-    """Normalized Hadamard matrix (block_r x block_r, R @ R.T == I; block_r a
-    power of two). Uses aiter's create_hadamard_matrix with a local Sylvester
-    fallback, so it doesn't depend on the sage_v2 modules."""
-    try:
-        try:
-            from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
-                create_hadamard_matrix,
-            )
-        except ImportError:
-            from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-                create_hadamard_matrix,
-            )
-        return create_hadamard_matrix(block_r, dtype=dtype) / (block_r ** 0.5)
-    except ImportError:
-        # Local Sylvester construction: H1=[[1]], H2n=[[Hn,Hn],[Hn,-Hn]].
-        assert block_r & (block_r - 1) == 0, "Hadamard block_r must be a power of 2"
-        H = torch.ones((1, 1), dtype=torch.float32)
-        while H.shape[0] < block_r:
-            H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
-        return (H / (block_r ** 0.5)).to(dtype)
+    return build_per_device_hadamard_matrix(block_r, dtype=torch.bfloat16, allow_missing_aiter=True)
 
 
 def _aiter_fp8_hadamard_matrix(block_r):
     """Per-device Hadamard matrix for the fp8 ASM paths, separate from
     ``HADAMARD_MATRIX`` (sage_v2) and built independently of the sage_v2
     modules."""
-    hadamard_matrix = {}
-    _hadamard = _build_hadamard_matrix(block_r, dtype=torch.bfloat16)
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            device = torch.device(f"cuda:{i}")
-            hadamard_matrix[device] = _hadamard.to(device)
-    else:
-        hadamard_matrix[torch.device("cpu")] = _hadamard.to(torch.device("cpu"))
-    return hadamard_matrix
+    return build_per_device_hadamard_matrix(block_r, dtype=torch.bfloat16)
 
 def _get_mla_cache_device_key(device):
     if device.type == "cuda":
@@ -671,12 +624,7 @@ def _fp8_hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     """Orthonormal Hadamard rotation along head_dim (in blocks of R.shape[-1]).
     Rotating both Q and K by R leaves Q @ K.T unchanged (kernel sees identical
     scores) while spreading outliers to cut fp8 quant error."""
-    d = x.shape[-1]
-    block_r = R.shape[-1]
-    R = R.to(x.dtype)
-    if block_r == d:
-        return torch.matmul(x, R)
-    return torch.matmul(x.unflatten(-1, (d // block_r, block_r)), R).flatten(-2)
+    return hadamard_rotate(x, R)
 
 
 @register_attention_function(AttentionBackendType.AITER_FP8)

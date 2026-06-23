@@ -47,7 +47,39 @@ environment_variables: Dict[str, Callable[[], Any]] = {
                 "XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE", None
             ),
     "AITER_SAGE_V2_BLOCK_R": lambda: os.environ.get("XFUSER_AITER_SAGE_V2_BLOCK_R", "128"),
+    "AITER_MXFP4_BLOCK_R": lambda: os.environ.get("XFUSER_AITER_MXFP4_BLOCK_R", "32"),
+    "AITER_MXFP4_HADAMARD": lambda: os.environ.get("XFUSER_AITER_MXFP4_HADAMARD", "0"),
+    "MXFP4_LOG_ACTIVATION_STATS": lambda: os.environ.get("XFUSER_MXFP4_LOG_ACTIVATION_STATS", "0"),
+    "MXFP4_LOG_ACTIVATION_STATS_EVERY": lambda: os.environ.get(
+        "XFUSER_MXFP4_LOG_ACTIVATION_STATS_EVERY", "1"
+    ),
+    "MXFP4_LOG_ACTIVATION_STATS_MAX_LAYERS": lambda: os.environ.get(
+        "XFUSER_MXFP4_LOG_ACTIVATION_STATS_MAX_LAYERS", "8"
+    ),
+    "MXFP4_LOG_ACTIVATION_STATS_SAMPLE_TOKENS": lambda: os.environ.get(
+        "XFUSER_MXFP4_LOG_ACTIVATION_STATS_SAMPLE_TOKENS", "256"
+    ),
+    "MXFP4_LOG_ACTIVATION_STATS_OUTPUT": lambda: os.environ.get(
+        "XFUSER_MXFP4_LOG_ACTIVATION_STATS_OUTPUT", None
+    ),
+    "MXFP4_LOG_ACTIVATION_STATS_LAYERS": lambda: os.environ.get(
+        "XFUSER_MXFP4_LOG_ACTIVATION_STATS_LAYERS", None
+    ),
 }
+
+
+def parse_env_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_mxfp4_hadamard_block_r(value: object, default: int = 32) -> int:
+    try:
+        block_r = int(value)
+    except (TypeError, ValueError):
+        return default
+    return block_r if block_r in (16, 32, 64, 128) else default
 
 
 def _is_hip():

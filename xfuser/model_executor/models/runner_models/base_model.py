@@ -684,11 +684,21 @@ class xFuserModel(abc.ABC):
                         fp8_layers=local_fp8,
                         use_hybrid_schedule=self.config.use_hybrid_gemm_schedule,
                         device=device,
+                        **self._mxfp4_linear_kwargs(),
                     )
             else:
                 quantize_linear_layers_to_fp8(block, device=device)
 
         return quantize_fn
+
+    def _mxfp4_linear_kwargs(self) -> dict:
+        kwargs = {}
+        if getattr(self.config, "mxfp4_hadamard", False):
+            kwargs["use_hadamard"] = True
+        block_r = getattr(self.config, "mxfp4_hadamard_block_r", None)
+        if block_r is not None:
+            kwargs["hadamard_block_r"] = block_r
+        return kwargs
 
     def _setup_mxfp4_gemms(self, local_rank):
         for module_name in self.settings.fp4_gemm_module_list:
@@ -704,6 +714,7 @@ class xFuserModel(abc.ABC):
                 fp8_layers=self.settings.fp8_precision_overrides,
                 use_hybrid_schedule=self.config.use_hybrid_gemm_schedule,
                 device=f"cuda:{local_rank}",
+                **self._mxfp4_linear_kwargs(),
             )
         # Any module specified in fp8 gemms modules list and not specified in fp4 gemms module list,
         # will be quantized to fp8, this is specially beneficial for MoE models like Wan2.2,
