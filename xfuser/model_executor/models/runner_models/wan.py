@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 from xfuser import xFuserArgs
 from xfuser.model_executor.models.transformers.transformer_wan import xFuserWanTransformer3DWrapper
 from xfuser.model_executor.models.transformers.transformer_wan_vace import xFuserWanVACETransformer3DWrapper
+from xfuser.model_executor.pipelines.pipeline_wan_t2v import xFuserWanT2VPipeline
 from xfuser.model_executor.pipelines.pipeline_wan_i2v import (
     xFuserWanImageToVideoPipeline,
 )
@@ -39,7 +40,11 @@ COMMON_FSDP_STRATEGY = {
         "dtype": torch.bfloat16,
     },
     "text_encoder": {
+        # CPU offload keeps shards on CPU between uses so the text encoder
+        # all_gather buffer doesn't compete with sharded transformer params
+        # during encode_prompt.
         "wrap_attrs": ["encoder.block"],
+        "offload_policy": "cpu",
     }
 }
 
@@ -279,6 +284,23 @@ class xFuserWan21I2VModel(xFuserModel):
 @register_model("Wan2.2-I2V")
 class xFuserWan22I2VModel(xFuserWan21I2VModel):
 
+    capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+        fully_shard_degree=True,
+        use_fp8_gemms=True,
+        use_cfg_parallel=True,
+        use_fp4_gemms=True,
+        use_fp8_comms=True,
+        use_hybrid_attn_schedule=True,
+        use_parallel_vae=True,
+        use_parallel_vae_encoder=True,
+        cross_attention_backend=True,
+        supports_sparge_attention_backends=True,
+        enable_tiling=True,
+        enable_slicing=True,
+    )
+
     def __init__(self, config: xFuserArgs) -> None:
         self.settings.model_name = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
         self.settings.output_name = "wan2.2_i2v"
@@ -495,7 +517,7 @@ class xFuserWan21T2VModel(xFuserModel):
             subfolder="transformer",
             attention_kwargs=_build_attention_kwargs(self.config),
         )
-        pipe = WanPipeline.from_pretrained(
+        pipe = xFuserWanT2VPipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
@@ -564,6 +586,21 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
         num_hybrid_gemm_high_precision_steps=5,
     )
 
+    capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+        fully_shard_degree=True,
+        use_fp8_gemms=True,
+        use_fp4_gemms=True,
+        use_fp8_comms=True,
+        use_hybrid_attn_schedule=True,
+        use_parallel_vae=True,
+        cross_attention_backend=True,
+        supports_sparge_attention_backends=True,
+        enable_tiling=True,
+        enable_slicing=True,
+    )
+
     def __init__(self, config: xFuserArgs) -> None:
         super().__init__(config)
         self.settings.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -589,7 +626,7 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
             subfolder="transformer_2",
             attention_kwargs=_build_attention_kwargs(self.config),
         )
-        pipe = WanPipeline.from_pretrained(
+        pipe = xFuserWanT2VPipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
@@ -615,6 +652,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         fully_shard_degree=True,
         use_fp8_gemms=True,
         use_fp4_gemms=True,
+        use_fp8_comms=True,
         use_hybrid_attn_schedule=True,
         use_hybrid_gemm_schedule=True,
         use_parallel_vae=True,
@@ -656,7 +694,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
             subfolder="transformer",
             attention_kwargs=_build_attention_kwargs(self.config),
         )
-        pipe_class = xFuserWanImageToVideoPipeline if self.config.task == "i2v" else WanPipeline
+        pipe_class = xFuserWanImageToVideoPipeline if self.config.task == "i2v" else xFuserWanT2VPipeline
         pipe = pipe_class.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
                 torch_dtype=torch.bfloat16,
@@ -728,6 +766,7 @@ class xFuserWan21VACEModel(xFuserModel):
         cross_attention_backend=True,
         enable_tiling=True,
         enable_slicing=True,
+        fully_shard_degree=True,
     )
 
     default_input_values = DefaultInputValues(
@@ -743,6 +782,15 @@ class xFuserWan21VACEModel(xFuserModel):
         fps=16,
         model_output_type="video",
         fp8_gemm_module_list=["transformer.blocks", "transformer.vace_blocks"],
+        fsdp_strategy={
+            "transformer": {
+                "wrap_attrs": ["blocks", "vace_blocks"],
+                "dtype": torch.bfloat16,
+            },
+            "text_encoder": {
+                "wrap_attrs": ["encoder.block"],
+            },
+        },
     )
 
     def __init__(self, config: xFuserArgs) -> None:

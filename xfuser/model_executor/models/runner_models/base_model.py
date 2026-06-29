@@ -25,9 +25,11 @@ from xfuser.core.utils.runner_utils import (
     log,
     load_dataset_prompts,
     quantize_linear_layers_to_fp8,
+    quantize_linear_layers_to_fp8_blockscale,
     quantize_linear_layers_to_fp4,
     quantize_linear_layers_to_nvfp4,
     convert_model_convs_to_channels_last,
+    _use_aiter_fp8_rdna4,
     rgetattr,
 )
 
@@ -42,7 +44,10 @@ from xfuser.core.distributed import (
     init_distributed_environment,
     shard_component,
 )
-from xfuser.core.distributed.attention_backend import AttentionBackendType
+from xfuser.core.distributed.attention_backend import (
+    AttentionBackendType,
+    SUPPORTS_PRE_QUANTIZATION_BACKENDS,
+)
 from xfuser.core.distributed.attention_schedule import (
     AttentionSchedule,
     GemmPrecisionSchedule,
@@ -74,6 +79,7 @@ _SPARGE_ATTENTION_BACKENDS = frozenset({
     AttentionBackendType.AITER_SPARGE_ASM_V2,
     AttentionBackendType.AITER_SPARGE_ASM_FP8,
     AttentionBackendType.AITER_SPARGE_V2,
+    AttentionBackendType.FLEX_BLOCK_SPARGE,
 })
 
 
@@ -125,6 +131,8 @@ class ModelCapabilities:
     # Other features
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
+    use_fp8_comms: bool = False
+    use_fbcache: bool = False
     use_hybrid_attn_schedule: bool = False
     use_hybrid_gemm_schedule: bool = False
     cross_attention_backend: bool = False
@@ -159,6 +167,7 @@ class ModelSettings:
     fp8_gemm_module_list: List[str] = None
     fp4_gemm_module_list: List[str] = None
     fp8_precision_overrides: Tuple[str] = None
+    fbcache_thresh: float = 0.12
     # FSDP strategy is just for the components to be sharded - other components will be moved to correct device automatically
     fsdp_strategy: dict = field(default_factory=lambda: {
         "": { # name, e.g. transformer
@@ -280,6 +289,23 @@ class xFuserModel(abc.ABC):
             self.pipe.enable_model_cpu_offload()
 
 
+    def _validate_fp8_comms_config(self, config: xFuserArgs) -> None:
+        if not self.capabilities.use_fp8_comms:
+            raise ValueError(f"Model {self.settings.model_name} does not support --use_fp8_comms.")
+        if (config.ulysses_degree or 1) <= 1:
+            raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
+        effective_backends = set()
+        if config.attention_backend:
+            effective_backends.add(_parse_attention_backend(config.attention_backend, "attention backend"))
+        if config.use_hybrid_attn_schedule and config.hybrid_attn_low_precision_backend:
+            effective_backends.add(_parse_attention_backend(config.hybrid_attn_low_precision_backend, "hybrid low-precision attention backend"))
+        if not effective_backends & SUPPORTS_PRE_QUANTIZATION_BACKENDS:
+            raise ValueError(
+                f"--use_fp8_comms requires an attention backend that supports pre-quantization "
+                f"({', '.join(b.name for b in SUPPORTS_PRE_QUANTIZATION_BACKENDS)}). "
+                f"Set --attention_backend or --hybrid_attn_low_precision_backend accordingly."
+            )
+
     def _validate_config(self, config: xFuserArgs) -> None:
         """ Validate if the model supports requested config """
         for key in ModelCapabilities.__annotations__.keys():
@@ -348,6 +374,9 @@ class xFuserModel(abc.ABC):
             raise ValueError(f"Model {self.settings.model_name} requires a task to be specified. Supported tasks: {self.settings.valid_tasks}")
         if config.dataset_path and not config.batch_size:
             raise ValueError(f"Dataset path specified without batch size. Please specify batch size for dataset inference.")
+
+        if config.use_fp8_comms:
+            self._validate_fp8_comms_config(config)
 
         if self.model_output_type == "video" and not self.fps:
             raise ValueError(f"Model {self.settings.model_name} produces video output but fps is not set.")
@@ -582,17 +611,28 @@ class xFuserModel(abc.ABC):
         if self.config.fully_shard_degree > 1:
             self._shard_model_with_fsdp()
         else:
-            self.pipe = self.pipe.to(f"cuda:{local_rank}")
+            offload_requested = (
+                self.config.enable_model_cpu_offload or self.config.enable_sequential_cpu_offload
+            )
+            # AITER FP8: quantizes layer-by-layer CPU→GPU individually before pipe.to(cuda).
+            # All other quant paths (FP4, torchao FP8) need weights on GPU first.
+            if self.config.use_fp8_gemms and _use_aiter_fp8_rdna4():
+                for module_name in self.settings.fp8_gemm_module_list:
+                    log(f"Quantizing {module_name} to FP8 block-scale (AITER)...")
+                    quantize_linear_layers_to_fp8_blockscale(
+                        rgetattr(self.pipe, module_name), device=f"cuda:{local_rank}"
+                    )
+            if not offload_requested:
+                self.pipe = self.pipe.to(f"cuda:{local_rank}")
             if self.config.use_fp4_gemms:
                 if _is_cuda():
                     self._setup_nvfp4_gemms(local_rank=local_rank)
                 else:
                     self._setup_mxfp4_gemms(local_rank=local_rank)
-            elif self.config.use_fp8_gemms:
+            if self.config.use_fp8_gemms and not _use_aiter_fp8_rdna4():
                 for module_name in self.settings.fp8_gemm_module_list:
-                    log(f"Quantizing linear layers in {module_name} to FP8...")
-                    module = rgetattr(self.pipe, module_name)
-                    quantize_linear_layers_to_fp8(module, device=f"cuda:{local_rank}")
+                    log(f"Quantizing {module_name} to FP8 (torchao)...")
+                    quantize_linear_layers_to_fp8(rgetattr(self.pipe, module_name), device=f"cuda:{local_rank}")
 
         if self.config.use_hybrid_attn_schedule:
             self._setup_hybrid_attn_schedule(input_args)
@@ -606,7 +646,7 @@ class xFuserModel(abc.ABC):
 
     def _shard_model_with_fsdp(self) -> None:
         """ Shard the model with FSDP based on settings """
-        if self.config.use_fp8_gemms:
+        if self.config.use_fp8_gemms and _is_cuda():
             from xfuser.core.utils.runner_utils import _TORCHAO_FLOAT8_FSDP2_PATCHES
             assert _TORCHAO_FLOAT8_FSDP2_PATCHES, (
                 "FSDP2 + FP8 requires torchao Float8Tensor patches but they failed to apply at "
@@ -617,18 +657,28 @@ class xFuserModel(abc.ABC):
         device_group = get_fs_group().device_group
         for component_name, component in self.pipe.components.items():
             if component_name in self.settings.fsdp_strategy:
-                log(f"Sharding {component_name} with FSDP...")
+                log(f"Sharding {component_name} with FSDP... "
+                    f"(VRAM before: {torch.cuda.memory_allocated(local_rank)/1e9:.2f}GB)")
                 strategy = self.settings.fsdp_strategy[component_name]
                 wrap_attrs = strategy.get("wrap_attrs", [])
                 dtype = strategy.get("dtype", None)
+                offload_policy = strategy.get("offload_policy", None)
                 quantize_fn = self._build_fsdp_quantize_fn(component_name, wrap_attrs, fs_local_rank)
                 reshard_after_forward = self.config.reshard_after_forward
                 fsdp_object = shard_component(
                     component, wrap_attrs, device_group, fs_local_rank, dtype,
                     quantize_fn=quantize_fn,
                     reshard_after_forward=reshard_after_forward,
+                    memory_efficient_init=self.config.memory_efficient_sharding,
+                    offload_policy=offload_policy,
+                    # All ranks load from the same checkpoint so states are already
+                    # identical. No broadcast needed regardless of offload policy.
+                    sync_module_states=False,
                 )
                 setattr(self.pipe, component_name, fsdp_object)
+                torch.cuda.empty_cache()
+                log(f"Sharded {component_name}. "
+                    f"(VRAM after: {torch.cuda.memory_allocated(local_rank)/1e9:.2f}GB)")
             else:
                 log(f"Skipping FSDP wrapping for {component_name}...")
                 if hasattr(component, "to"):
@@ -636,6 +686,30 @@ class xFuserModel(abc.ABC):
                 else:
                     log(f"Component {component_name} has no .to() method, skipping device move.")
                     pass
+
+        # diffusers' _execution_device short-circuits on the first nn.Module component
+        # that lacks _hf_hook, returning self.device (= first module's .device).
+        # With CPUOffloadPolicy, text_encoder.device = cpu, breaking latent generation.
+        # Fix: give every nn.Module component a minimal _hf_hook so _execution_device
+        # continues past them, with cpu-offloaded components advertising cuda.
+        cpu_offloaded = {
+            name for name, s in self.settings.fsdp_strategy.items()
+            if s.get("offload_policy") == "cpu"
+        }
+        if cpu_offloaded:
+            cuda_device = f"cuda:{local_rank}"
+
+            class _ExecDeviceHook:
+                def __init__(self, execution_device):
+                    self.execution_device = execution_device
+
+            for name, component in self.pipe.components.items():
+                if not isinstance(component, torch.nn.Module):
+                    continue
+                if not hasattr(component, "_hf_hook"):
+                    component._hf_hook = _ExecDeviceHook(
+                        cuda_device if name in cpu_offloaded else None
+                    )
 
     def _build_fsdp_quantize_fn(
         self, component_name: str, wrap_attrs: list, local_rank: int
@@ -686,7 +760,10 @@ class xFuserModel(abc.ABC):
                         device=device,
                     )
             else:
-                quantize_linear_layers_to_fp8(block, device=device)
+                if _use_aiter_fp8_rdna4():
+                    quantize_linear_layers_to_fp8_blockscale(block, device=device)
+                else:
+                    quantize_linear_layers_to_fp8(block, device=device)
 
         return quantize_fn
 

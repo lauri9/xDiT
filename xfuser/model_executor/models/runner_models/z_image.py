@@ -56,11 +56,22 @@ class xFuserZImageModel(xFuserModel):
         use_cfg_parallel=True,
         enable_tiling=True,
         enable_slicing=True,
+        fully_shard_degree=True,
+        use_fp8_gemms=True,
     )
     settings = ModelSettings(
         model_name="Tongyi-MAI/Z-Image",
         output_name="z_image",
         model_output_type="image",
+        fsdp_strategy={
+            "transformer": {
+                "wrap_attrs": ["noise_refiner", "context_refiner", "layers"],
+            },
+            "text_encoder": {
+                "wrap_attrs": ["model.language_model.layers"],
+            },
+        },
+        fp8_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
     )
 
     def _load_model(self) -> DiffusionPipeline:
@@ -95,8 +106,7 @@ class xFuserZImageModel(xFuserModel):
 class xFuserZImageTurboModel(xFuserModel):
 
     capabilities = ModelCapabilities(
-        enable_tiling=True,
-        enable_slicing=True,
+        use_fp8_gemms=True,
     )
     default_input_values = DefaultInputValues(
         height=1024,
@@ -104,10 +114,22 @@ class xFuserZImageTurboModel(xFuserModel):
         num_inference_steps=9,
         guidance_scale=0.0,
     )
+    capabilities = ModelCapabilities(
+        fully_shard_degree=True,
+    )
     settings = ModelSettings(
         model_name="Tongyi-MAI/Z-Image-Turbo",
         output_name="z_image_turbo",
         model_output_type="image",
+        fsdp_strategy={
+            "transformer": {
+                "wrap_attrs": ["noise_refiner", "context_refiner", "layers"],
+            },
+            "text_encoder": {
+                "wrap_attrs": ["model.language_model.layers"],
+            },
+        },
+        fp8_gemm_module_list=["transformer.layers", "transformer.noise_refiner", "transformer.context_refiner"],
     )
 
     def _load_model(self) -> DiffusionPipeline:

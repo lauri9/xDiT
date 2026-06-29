@@ -30,16 +30,19 @@ logger = init_logger(__name__)
 class FlexibleArgumentParser(argparse.ArgumentParser):
     """ArgumentParser that allows both underscore and dash in names."""
 
-    @staticmethod
-    def _normalize_name(name: str) -> str:
-        # Preserve the leading "--" (and BooleanOptionalAction's "--no-"
-        # prefix); only normalize hyphens to underscores inside the actual
-        # argument name. Without this, "--no-foo" would be rewritten to
-        # "--no_foo" which doesn't match what BooleanOptionalAction
-        # registered ("--no-foo").
+    def _normalize_name(self, name: str) -> str:
+        # First, try the standard normalization (all hyphens to underscores)
+        fully_normalized = "--" + name[len("--"):].replace("-", "_")
+        if fully_normalized in self._option_string_actions:
+            return fully_normalized
+
+        # If not found, check if it's a BooleanOptionalAction (starts with --no-)
         if name.startswith("--no-"):
-            return "--no-" + name[len("--no-"):].replace("-", "_")
-        return "--" + name[len("--"):].replace("-", "_")
+            no_dash_normalized = "--no-" + name[len("--no-"):].replace("-", "_")
+            if no_dash_normalized in self._option_string_actions:
+                return no_dash_normalized
+
+        return fully_normalized
 
     def parse_args(self, args=None, namespace=None):
         if args is None:
@@ -135,6 +138,8 @@ class xFuserArgs:
     cross_attention_backend: Optional[str] = None
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
+    use_fp8_comms: bool = False
+    fp8_comms_scale: Optional[float] = None
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -151,6 +156,7 @@ class xFuserArgs:
     use_fsdp: bool = False
     fully_shard_degree: int = 1
     reshard_after_forward: bool = True
+    memory_efficient_sharding: bool = False
     use_vae_channels_last_format: bool = False
     # Hybrid attention schedule
     use_hybrid_attn_schedule: bool = False
@@ -401,6 +407,17 @@ class xFuserArgs:
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
         )
+        runtime_group.add_argument(
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        runtime_group.add_argument(
+            "--fp8_comms_scale",
+            type=float,
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
+        )
 
         # DiTFastAttn arguments
         fast_attn_group = parser.add_argument_group("DiTFastAttn Options")
@@ -518,6 +535,14 @@ class xFuserArgs:
                  "Only valid with --fully_shard_degree > 1.",
         )
         parser.add_argument(
+            "--memory_efficient_sharding",
+            action="store_true",
+            default=False,
+            help="Load transformer blocks one at a time during init to reduce peak GPU memory. "
+                 "Slightly slower at inference - only use if the model OOMs during load despite "
+                 "--fully_shard_degree. Requires --fully_shard_degree > 1.",
+        )
+        parser.add_argument(
             "--height",
             type=int,
             help="The height of image",
@@ -603,6 +628,17 @@ class xFuserArgs:
             "--use_fp4_gemms",
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
+        )
+        parser.add_argument(
+            "--use_fp8_comms",
+            action="store_true",
+            help="Quantize Ulysses all-to-all communication to FP8.",
+        )
+        parser.add_argument(
+            "--fp8_comms_scale",
+            type=float,
+            default=None,
+            help="Override the model-specific FP8 communication scale.",
         )
 
         parser.add_argument(
@@ -790,6 +826,11 @@ class xFuserArgs:
             default=None,
             help="Path to the low-noise distilled transformer_2 safetensors file.",
         )
+        parser.add_argument(
+            "--use_fbcache",
+            action="store_true",
+            help="Enable FBCache to accelerate the diffusion loop",
+        )
         return parser
 
 
@@ -882,6 +923,8 @@ class xFuserArgs:
             spargeattn_simthreshold=self.spargeattn_simthreshold,
             spargeattn_cdfthreshold=self.spargeattn_cdfthreshold,
             use_spargeattn_head_balance=self.use_spargeattn_head_balance,
+            use_fp8_comms=self.use_fp8_comms,
+            fp8_comms_scale=self.fp8_comms_scale,
         )
 
         parallel_config = ParallelConfig(

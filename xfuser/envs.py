@@ -47,6 +47,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
                 "XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE", None
             ),
     "AITER_SAGE_V2_BLOCK_R": lambda: os.environ.get("XFUSER_AITER_SAGE_V2_BLOCK_R", "128"),
+    "XDIT_FBCACHE_THRESH": lambda: os.environ.get("XDIT_FBCACHE_THRESH", None),
 }
 
 
@@ -395,7 +396,7 @@ class PackagesEnvChecker:
     def _on_rdna4(self):
         device = torch.cuda.current_device()
         gcn_arch_name = torch.cuda.get_device_properties(device).gcnArchName
-        return "gfx1201" in gcn_arch_name
+        return any(arch in gcn_arch_name for arch in ["gfx1200", "gfx1201"])
 
 
 PACKAGES_CHECKER = PackagesEnvChecker()

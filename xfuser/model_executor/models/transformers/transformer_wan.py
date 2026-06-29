@@ -17,6 +17,7 @@ from xfuser.core.distributed import (
     get_sp_group,
     get_runtime_state,
 )
+from xfuser.core.distributed.attention_backend import SUPPORTS_PRE_QUANTIZATION_BACKENDS
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -93,7 +94,6 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             image_context_length = encoder_hidden_states.shape[1] - 512
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
-
         query, key, value = self._get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
         query = attn.norm_q(query)
@@ -121,6 +121,17 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
 
+        runtime_state = get_runtime_state()
+        use_fp8_comms = (
+            not self.is_cross_attention
+            and runtime_state.fp8_comms is not None
+            and runtime_state.attention_backend in SUPPORTS_PRE_QUANTIZATION_BACKENDS
+        )
+
+        # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
+        if not self.is_cross_attention and runtime_state.fp8_comms is not None:
+            runtime_state.fp8_comms.update_running_max(query, key, value)
+
         # I2V task
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
@@ -135,16 +146,16 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                                                         value_img.transpose(1, 2),
                                                         backend=backend,
                                                         attention_kwargs=self.attention_kwargs,
-                                                        ).transpose(1, 2)
+                                                        use_fp8_comms=use_fp8_comms).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
-
 
         hidden_states = self.attention_function(
             query.transpose(1, 2),
             key.transpose(1, 2),
             value.transpose(1, 2),
             backend=backend,
+            use_fp8_comms=use_fp8_comms,
             attention_kwargs=self.attention_kwargs,
             head_balance_layer=attn,
         ).transpose(1, 2)

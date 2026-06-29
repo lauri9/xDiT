@@ -16,10 +16,18 @@ from xfuser.core.sparge_attention.sparge import (
     setup_sparge,
     compute_sparge_block_mask,
     restore_sparge_output,
+    mask_padded_kv_blocks,
 )
 from xfuser.core.sparge_attention import head_balance
 
 ATTENTION_FUNCTION_REGISTRY = {}
+
+env_info = PACKAGES_CHECKER.get_packages_info()
+if env_info.get("has_aiter"):
+    import aiter as _aiter
+    AITER_FP8_DTYPE = _aiter.dtypes.fp8
+else:
+    AITER_FP8_DTYPE = torch.float8_e4m3fn  # fallback only; fp8_comms requires aiter so this path is unreachable in practice
 
 def _setup_aiter_environment_variables():
     AITER_FP8_STATIC_SCALE_WITH_DESCALE = environment_variables["AITER_FP8_STATIC_SCALE_WITH_DESCALE"]()
@@ -469,8 +477,14 @@ class AttentionBackendType(Enum):
     AITER_SPARGE_ASM_V2 = "AITER Sparge ASM V2 (mxfp4)"
     AITER_SPARGE_ASM_FP8 = "AITER Sparge ASM FP8"
     AITER_SPARGE_V2 = "AITER Sparge V2"
+    FLEX_BLOCK_SPARGE = "Flex Block Sparge"
     AITER_FLYDSL = "AITER FlyDSL"
     NPU = "NPU"
+
+SUPPORTS_PRE_QUANTIZATION_BACKENDS = {
+    AttentionBackendType.AITER_FP8,
+    AttentionBackendType.AITER_SAGE_V2,
+}
 
 def register_attention_function(backend_type):
     """
@@ -685,6 +699,9 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     Performs the necessary tensor permutes and
     then calls attention through AITER
     """
+    attention_kwargs = attention_kwargs or {}
+    pre_quantized = attention_kwargs.get("pre_quantized", False)
+
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
@@ -695,39 +712,41 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     key = _fp8_hadamard_rotate(key, R).contiguous()
 
     softmax_lse = None
-    quant_dtype = aiter.dtypes.fp8
-    dtypeMax = torch.finfo(quant_dtype).max
-    if AITER_FP8_HAS_DESCALE:
-        # If AITER_FP8_STATIC_SCALE_WITH_DESCALE is not set, use dynamic scaling.
-        # Set the environment variable XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE
-        # to a float value (i.e 2.5) to use static scaling.
-        if AITER_FP8_STATIC_SCALE_WITH_DESCALE is None:
-            scale = None
-        else:
-            scale=torch.tensor(AITER_FP8_STATIC_SCALE_WITH_DESCALE, dtype=torch.float32, device=query.device)
-    else:
-        # Use static scale of 1.0, since descale is not available.
-        scale = torch.tensor(AITER_FP8_STATIC_SCALE_NO_DESCALE, dtype=torch.float32, device=query.device)
-    quant_q, q_descale = aiter.per_tensor_quant(query,
-                                                scale=scale,
-                                                quant_dtype=quant_dtype,
-                                                dtypeMax=dtypeMax)
-    quant_k, k_descale = aiter.per_tensor_quant(key,
-                                                scale=scale,
-                                                quant_dtype=quant_dtype,
-                                                dtypeMax=dtypeMax)
-    quant_v, v_descale = aiter.per_tensor_quant(value,
-                                                scale=scale,
-                                                quant_dtype=quant_dtype,
-                                                dtypeMax=dtypeMax)
 
-    kwargs = {}
-    if AITER_FP8_HAS_DESCALE:
+    if pre_quantized:
+        quant_q = query
+        quant_k = key
+        quant_v = value
         kwargs = {
+            "q_descale": attention_kwargs["q_descale"],
+            "k_descale": attention_kwargs["k_descale"],
+            "v_descale": attention_kwargs["v_descale"],
+        }
+    else:
+        quant_dtype = aiter.dtypes.fp8
+        dtypeMax = torch.finfo(quant_dtype).max
+        if AITER_FP8_HAS_DESCALE:
+            # If AITER_FP8_STATIC_SCALE_WITH_DESCALE is not set, use dynamic scaling.
+            # Set the environment variable XFUSER_AITER_FP8_STATIC_SCALE_WITH_DESCALE
+            # to a float value (i.e 2.5) to use static scaling.
+            if AITER_FP8_STATIC_SCALE_WITH_DESCALE is None:
+                scale = None
+            else:
+                scale = torch.tensor(AITER_FP8_STATIC_SCALE_WITH_DESCALE, dtype=torch.float32, device=query.device)
+        else:
+            # Use static scale of 1.0, since descale is not available.
+            scale = torch.tensor(AITER_FP8_STATIC_SCALE_NO_DESCALE, dtype=torch.float32, device=query.device)
+        quant_q, q_descale = aiter.per_tensor_quant(query, scale=scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
+        quant_k, k_descale = aiter.per_tensor_quant(key,   scale=scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
+        quant_v, v_descale = aiter.per_tensor_quant(value, scale=scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
+        kwargs = {}
+        if AITER_FP8_HAS_DESCALE:
+            kwargs = {
                 "q_descale": q_descale,
                 "k_descale": k_descale,
                 "v_descale": v_descale,
             }
+
     output = aiter.flash_attn_fp8_pertensor_func(
         quant_q, quant_k, quant_v,
         causal=is_causal,
@@ -1056,7 +1075,7 @@ def _read_sparge_kwargs(attention_kwargs):
         attn_kwargs.get("encoder_sequence_length", 0),
     )
 
-def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, config):
+def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, config, pad_block_divisible=False):
     simthreshd1, cdfthreshd, reorder, use_static, thw, esl = _read_sparge_kwargs(attention_kwargs)
     q, k, v, state, static_mask = setup_sparge(
         query, key, value,
@@ -1066,6 +1085,7 @@ def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, con
         reorder_sequence=reorder,
         use_static_block_mask=use_static,
         block_m=config["BLOCK_M"], block_n=config["BLOCK_N"],
+        pad_block_divisible=pad_block_divisible,
     )
     block_mask = compute_sparge_block_mask(
         q, k,
@@ -1073,9 +1093,10 @@ def _build_sparge_block_mask(query, key, value, is_causal, attention_kwargs, con
         cdfthreshd=cdfthreshd,
         is_causal=is_causal,
         static_block_mask=static_mask,
-        text_len=state.text_len,
+        text_len=state.text_len + state.tail_pad,
         block_m=config["BLOCK_M"], block_n=config["BLOCK_N"],
     )
+    block_mask = mask_padded_kv_blocks(block_mask, state, config["BLOCK_N"])
     num_heads = q.shape[1]
     # Per-head selected-block cost for the Ulysses head-balancer, written into
     # the scratch "cost sink" tensor that USP passes down via attention_kwargs
@@ -1302,12 +1323,30 @@ def _aiter_sparge_v2_attn_call(query, key, value, dropout_p, is_causal, attentio
     )
     return restore_sparge_output(output, state), None
 
+@register_attention_function(AttentionBackendType.FLEX_BLOCK_SPARGE)
+def _flex_block_sparge_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    config = {"BLOCK_M": 256, "BLOCK_N": 256}
+    q, k, v, state, block_mask, num_heads = _build_sparge_block_mask(
+        query, key, value, is_causal, attention_kwargs, config, pad_block_divisible=True
+    )
+    output = flex_block_attn_op(
+        q.contiguous(), k.contiguous(), v.contiguous(),
+        config["BLOCK_M"], config["BLOCK_N"], block_mask,
+    )
+    return restore_sparge_output(output, state), None
+
 @register_attention_function(AttentionBackendType.AITER_FLYDSL)
 def _aiter_flydsl_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
-    # This kernel only supports causal self-attention; fall back for cross-attention
-    # and non-causal attention.
-    if not is_causal or query.shape[2] != key.shape[2]:
+    # Cross-attention is unsupported. For non-causal self-attention, this kernel raises
+    # when the seq_len padding ratio to align to 128 exceeds 0.5% (same check as the kernel).
+    if query.shape[2] != key.shape[2]:
         return _sdpa_flash_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs)
+    if not is_causal:
+        seq_len = query.shape[2]
+        pad = (-seq_len) % 128
+        # 199*pad > seq_len is pad/(seq_len+pad) > 0.005 (0.5%) in integer arithmetic.
+        if pad > 0 and 199 * pad > seq_len:
+            return _sdpa_flash_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs)
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
