@@ -418,6 +418,9 @@ class RuntimeState(metaclass=ABCMeta):
             try:
                 from aiter.ops.mha import flash_attn_mxfp4_pertensor_func
                 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+                from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import (
+                    sage_quant_mxfp4_fp8_input,
+                )
             except ImportError:
                 raise RuntimeError(
                     "AITER mxfp4 ASM attention is not available; this backend "
@@ -425,7 +428,9 @@ class RuntimeState(metaclass=ABCMeta):
                     "aiter.ops.mha.flash_attn_mxfp4_pertensor_func (the dense "
                     "sibling of flash_attn_mxfp4_sparse_pertensor_func) plus "
                     "aiter.ops.triton.quant.sage_attention_quant_wrappers."
-                    "sage_quant_mxfp4."
+                    "sage_quant_mxfp4 and "
+                    "aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper."
+                    "sage_quant_mxfp4_fp8_input."
                 ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE:
             msg = "AITER Sparge attention is not available, please update AITER"

@@ -383,6 +383,9 @@ if env_info["has_aiter"]:
     try:
         from aiter.ops.mha import flash_attn_mxfp4_pertensor_func
         from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+        from aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper import (
+            sage_quant_mxfp4_fp8_input,
+        )
     except ImportError:
         pass # Error is raised in runtime_state.py if AITER_MXFP4 is not available.
     try:
@@ -481,9 +484,12 @@ class AttentionBackendType(Enum):
     AITER_FLYDSL = "AITER FlyDSL"
     NPU = "NPU"
 
+_FP8_INPUT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
 SUPPORTS_PRE_QUANTIZATION_BACKENDS = {
     AttentionBackendType.AITER_FP8,
     AttentionBackendType.AITER_SAGE_V2,
+    AttentionBackendType.AITER_MXFP4,
 }
 
 def register_attention_function(backend_type):
@@ -693,6 +699,13 @@ def _fp8_hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x.unflatten(-1, (d // block_r, block_r)), R).flatten(-2)
 
 
+def _mxfp4_v_scale_from_fp8_comms(v_descale: torch.Tensor, v_bshd: torch.Tensor) -> torch.Tensor:
+    """Expand per-tensor fp8-comms descale to [B, H, D] for sage_quant_mxfp4_fp8_input."""
+    v_scale = v_descale.reshape(()).to(device=v_bshd.device, dtype=torch.float32)
+    b, _, h, d = v_bshd.shape
+    return v_scale.expand(b, h, d).contiguous()
+
+
 @register_attention_function(AttentionBackendType.AITER_FP8)
 def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
@@ -781,14 +794,17 @@ def _aiter_i8fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kw
 
 @register_attention_function(AttentionBackendType.AITER_MXFP4)
 def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
+    attention_kwargs = attention_kwargs or {}
+    pre_quantized = attention_kwargs.get("pre_quantized", False)
+
     q_bshd = torch.permute(query, [0, 2, 1, 3]).contiguous()
     k_bshd = torch.permute(key,   [0, 2, 1, 3]).contiguous()
     v_bshd = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
     fp8_type = aiter.dtypes.fp8
-    qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
-        q_bshd, k_bshd, v_bshd,
-        fp8_type, torch.finfo(fp8_type).max,
+    mxfp4_quant_kwargs = dict(
+        FP8_TYPE=fp8_type,
+        FP8_MAX=torch.finfo(fp8_type).max,
         BLKQ=_AITER_SPARGE_ASM_BLOCK_M,
         BLKK=64,
         layout="bshd",
@@ -796,6 +812,23 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
         BLOCK_R=AITER_SAGE_V2_BLOCK_R,
         q_smoothing=False,
     )
+    if (
+        pre_quantized
+        and q_bshd.dtype in _FP8_INPUT_DTYPES
+        and k_bshd.dtype in _FP8_INPUT_DTYPES
+    ):
+        v_scale = (
+            _mxfp4_v_scale_from_fp8_comms(attention_kwargs["v_descale"], v_bshd)
+            if v_bshd.dtype in _FP8_INPUT_DTYPES
+            else None
+        )
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
+            q_bshd, k_bshd, v_bshd, **mxfp4_quant_kwargs, v_scale=v_scale,
+        )
+    else:
+        qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(
+            q_bshd, k_bshd, v_bshd, **mxfp4_quant_kwargs,
+        )
 
     # qq.shape[-1] = hd/2 because of fp4 packing.
     softmax_scale = (qq.shape[-1] * 2) ** -0.5
