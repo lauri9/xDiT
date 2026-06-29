@@ -707,9 +707,12 @@ def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwar
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
 
     # Hadamard-rotate Q,K before quant: QK-preserving (kernel unchanged), cuts fp8 quant error.
-    R = FP8_HADAMARD_MATRIX[query.device]
-    query = _fp8_hadamard_rotate(query, R).contiguous()
-    key = _fp8_hadamard_rotate(key, R).contiguous()
+    # Skip when pre_quantized: Q/K are already FP8 from fp8 comms (Hadamard was applied
+    # on bf16 in USP before quantization). torch.matmul does not support FP8 on CUDA.
+    if not pre_quantized:
+        R = FP8_HADAMARD_MATRIX[query.device]
+        query = _fp8_hadamard_rotate(query, R).contiguous()
+        key = _fp8_hadamard_rotate(key, R).contiguous()
 
     softmax_lse = None
 

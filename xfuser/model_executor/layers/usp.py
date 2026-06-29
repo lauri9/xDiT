@@ -162,12 +162,12 @@ def _fp8_comms_input_all_to_all(
 
 def _fp8_comms_output_all_to_all(out: torch.Tensor, v_scale_t: torch.Tensor) -> torch.Tensor:
     """Quantize attention output to FP8, run output all-to-all, dequantize back."""
-    out_dtype = out.dtype
+    restore_dtype = out.dtype if out.dtype not in _FP8_DTYPES else torch.bfloat16
     if out.dtype not in _FP8_DTYPES:
         out_fp8, out_descale = _per_tensor_quant(out, v_scale_t)
     else:
         out_fp8, out_descale = out, v_scale_t
-    return (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(out_dtype)
+    return (_ft_c_output_all_to_all(out_fp8).float() * out_descale).to(restore_dtype)
 
 
 def _combined_qkv_all_to_all(q, k, v):
@@ -396,6 +396,15 @@ def USP(
     qkv_amaxes = None
     if get_ulysses_parallel_world_size() > 1:
         if use_fp8_comms:
+            fp8_comms_backend = backend if backend is not None else get_runtime_state().attention_backend
+            if fp8_comms_backend == AttentionBackendType.AITER_FP8:
+                from xfuser.core.distributed.attention_backend import (
+                    FP8_HADAMARD_MATRIX,
+                    _fp8_hadamard_rotate,
+                )
+                R = FP8_HADAMARD_MATRIX[query.device]
+                query = _fp8_hadamard_rotate(query, R).contiguous()
+                key = _fp8_hadamard_rotate(key, R).contiguous()
             query, key, value, attn_kwargs_update, qkv_scales, qkv_amaxes = _fp8_comms_input_all_to_all(query, key, value)
             attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:

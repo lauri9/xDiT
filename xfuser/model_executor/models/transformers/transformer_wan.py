@@ -88,6 +88,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             # as some backends may have too much overhead for cross-attention.
             backend = get_runtime_state().get_cross_attention_backend()
 
+        activation_dtype = hidden_states.dtype
+
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
             # 512 is the context length of the text encoder, hardcoded for now
@@ -148,7 +150,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                                                         attention_kwargs=self.attention_kwargs,
                                                         use_fp8_comms=use_fp8_comms).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
-            hidden_states_img = hidden_states_img.type_as(query)
+            hidden_states_img = hidden_states_img.to(activation_dtype)
 
         hidden_states = self.attention_function(
             query.transpose(1, 2),
@@ -161,7 +163,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         ).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.type_as(query)
+        hidden_states = hidden_states.to(activation_dtype)
 
         if hidden_states_img is not None:
             hidden_states = hidden_states + hidden_states_img
