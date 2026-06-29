@@ -699,9 +699,13 @@ def _fp8_hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x.unflatten(-1, (d // block_r, block_r)), R).flatten(-2)
 
 
-def _mxfp4_v_scale_from_fp8_comms(v_descale: torch.Tensor, v_bshd: torch.Tensor) -> torch.Tensor:
-    """Expand per-tensor fp8-comms descale to [B, H, D] for sage_quant_mxfp4_fp8_input."""
-    v_scale = v_descale.reshape(()).to(device=v_bshd.device, dtype=torch.float32)
+def _mxfp4_v_scale_from_fp8_comms(v_scale: torch.Tensor, v_bshd: torch.Tensor) -> torch.Tensor:
+    """Expand per-tensor fp8-comms quant scale to [B, H, D] for mxfp4 fp8 V passthrough.
+
+    ``aiter.per_tensor_quant`` returns the scale used as ``x_fp8 = x / scale``; the
+    mxfp4 kernel multiplies fp8 V by the same factor to recover magnitude.
+    """
+    v_scale = v_scale.reshape(()).to(device=v_bshd.device, dtype=torch.float32)
     b, _, h, d = v_bshd.shape
     return v_scale.expand(b, h, d).contiguous()
 
