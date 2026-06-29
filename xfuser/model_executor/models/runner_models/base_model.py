@@ -297,13 +297,35 @@ class xFuserModel(abc.ABC):
         effective_backends = set()
         if config.attention_backend:
             effective_backends.add(_parse_attention_backend(config.attention_backend, "attention backend"))
-        if config.use_hybrid_attn_schedule and config.hybrid_attn_low_precision_backend:
-            effective_backends.add(_parse_attention_backend(config.hybrid_attn_low_precision_backend, "hybrid low-precision attention backend"))
+        if config.use_hybrid_attn_schedule:
+            if config.hybrid_attn_schedule:
+                effective_backends.update(
+                    AttentionSchedule.from_comma_delimited_string(
+                        config.hybrid_attn_schedule
+                    ).backends
+                )
+            else:
+                if config.hybrid_attn_low_precision_backend:
+                    effective_backends.add(
+                        _parse_attention_backend(
+                            config.hybrid_attn_low_precision_backend,
+                            "hybrid low-precision attention backend",
+                        )
+                    )
+                if config.hybrid_attn_high_precision_backend:
+                    effective_backends.add(
+                        _parse_attention_backend(
+                            config.hybrid_attn_high_precision_backend,
+                            "hybrid high-precision attention backend",
+                        )
+                    )
         if not effective_backends & SUPPORTS_PRE_QUANTIZATION_BACKENDS:
             raise ValueError(
                 f"--use_fp8_comms requires an attention backend that supports pre-quantization "
                 f"({', '.join(b.name for b in SUPPORTS_PRE_QUANTIZATION_BACKENDS)}). "
-                f"Set --attention_backend or --hybrid_attn_low_precision_backend accordingly."
+                f"Set --attention_backend, --hybrid_attn_schedule, or "
+                f"--hybrid_attn_low_precision_backend / --hybrid_attn_high_precision_backend "
+                f"so at least one scheduled backend supports pre-quantization."
             )
 
     def _validate_config(self, config: xFuserArgs) -> None:
