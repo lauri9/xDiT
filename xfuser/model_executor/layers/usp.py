@@ -360,7 +360,6 @@ def USP(
     )
     hb_inv = None
     hb_cost_sink = None
-    hb_attention_kwargs = attention_kwargs
     if hb_active:
         hb_perm = hb_perm.clone()  # snapshot the permutation applied this step
         hb_inv = torch.argsort(hb_perm)
@@ -372,10 +371,6 @@ def USP(
         # attention_kwargs. Written in-place by the backend; read
         # back below..
         hb_cost_sink = query.new_zeros(query.shape[1] // hb_uly, dtype=torch.float32)
-        hb_attention_kwargs = {
-            **(attention_kwargs or {}),
-            head_balance.COST_SINK_KEY: hb_cost_sink,
-        }
     else:
         hb_perm = None
 
@@ -413,6 +408,14 @@ def USP(
             query = _ft_c_input_all_to_all(query)
             key = _ft_c_input_all_to_all(key)
             value = _ft_c_input_all_to_all(value)
+
+    if hb_active:
+        hb_attention_kwargs = {
+            **(attention_kwargs or {}),
+            head_balance.COST_SINK_KEY: hb_cost_sink,
+        }
+    else:
+        hb_attention_kwargs = attention_kwargs
 
     if attn_layer:
         key, value = _update_and_get_kv_cache(key, value, attn_layer)
