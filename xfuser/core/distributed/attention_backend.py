@@ -699,17 +699,6 @@ def _fp8_hadamard_rotate(x: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x.unflatten(-1, (d // block_r, block_r)), R).flatten(-2)
 
 
-def _mxfp4_v_scale_from_fp8_comms(v_scale: torch.Tensor, v_bshd: torch.Tensor) -> torch.Tensor:
-    """Expand per-tensor fp8-comms quant scale to [B, H, D] for mxfp4 fp8 V passthrough.
-
-    ``aiter.per_tensor_quant`` returns the scale used as ``x_fp8 = x / scale``; the
-    mxfp4 kernel multiplies fp8 V by the same factor to recover magnitude.
-    """
-    v_scale = v_scale.reshape(()).to(device=v_bshd.device, dtype=torch.float32)
-    b, _, h, d = v_bshd.shape
-    return v_scale.expand(b, h, d).contiguous()
-
-
 @register_attention_function(AttentionBackendType.AITER_FP8)
 def _aiter_fp8_attn_call(query, key, value, dropout_p, is_causal, attention_kwargs=None):
     """
@@ -821,13 +810,14 @@ def _aiter_mxfp4_attn_call(query, key, value, dropout_p, is_causal, attention_kw
         and q_bshd.dtype in _FP8_INPUT_DTYPES
         and k_bshd.dtype in _FP8_INPUT_DTYPES
     ):
-        v_scale = (
-            _mxfp4_v_scale_from_fp8_comms(attention_kwargs["v_descale"], v_bshd)
-            if v_bshd.dtype in _FP8_INPUT_DTYPES
-            else None
-        )
         qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4_fp8_input(
-            q_bshd, k_bshd, v_bshd, **mxfp4_quant_kwargs, v_scale=v_scale,
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            **mxfp4_quant_kwargs,
+            q_input_scale=attention_kwargs["q_descale"],
+            k_input_scale=attention_kwargs["k_descale"],
+            v_scale=attention_kwargs["v_descale"] if v_bshd.dtype in _FP8_INPUT_DTYPES else None,
         )
     else:
         qq, qd, kq, kd, vq, vd, _ = sage_quant_mxfp4(

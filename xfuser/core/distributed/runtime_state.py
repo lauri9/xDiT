@@ -424,13 +424,11 @@ class RuntimeState(metaclass=ABCMeta):
             except ImportError:
                 raise RuntimeError(
                     "AITER mxfp4 ASM attention is not available; this backend "
-                    "needs the dense gfx950 .co (fwd_hd128_mxfp4.co) and "
-                    "aiter.ops.mha.flash_attn_mxfp4_pertensor_func (the dense "
-                    "sibling of flash_attn_mxfp4_sparse_pertensor_func) plus "
-                    "aiter.ops.triton.quant.sage_attention_quant_wrappers."
-                    "sage_quant_mxfp4 and "
-                    "aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper."
-                    "sage_quant_mxfp4_fp8_input."
+                    "needs the dense gfx950 .co (fwd_hd128_mxfp4.co), "
+                    "aiter.ops.mha.flash_attn_mxfp4_pertensor_func, "
+                    "aiter.ops.triton.quant.sage_attention_quant_wrappers.sage_quant_mxfp4, "
+                    "and aiter.ops.triton.quant.sage_attention_quant_fp8_input_wrapper."
+                    "sage_quant_mxfp4_fp8_input for fp8-comms input."
                 ) from None
         elif attention_backend == AttentionBackendType.AITER_SPARGE:
             msg = "AITER Sparge attention is not available, please update AITER"
