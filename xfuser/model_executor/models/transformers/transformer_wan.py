@@ -132,7 +132,19 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
 
         # update running max for dynamic scale calibration -- pure in-place tensor ops, no graph break
         if not self.is_cross_attention and runtime_state.fp8_comms is not None:
-            runtime_state.fp8_comms.update_running_max(query, key, value)
+            fp8_owner = getattr(attn, "fp8_comms_owner", None)
+            if fp8_owner is not None and hasattr(attn, "fp8_comms_layer_idx"):
+                runtime_state.fp8_comms.update_running_max(
+                    fp8_owner,
+                    attn.fp8_comms_layer_idx,
+                    query,
+                    key,
+                    value,
+                )
+
+        fp8_q_scale = getattr(attn, "fp8_q_scale", None)
+        fp8_k_scale = getattr(attn, "fp8_k_scale", None)
+        fp8_v_scale = getattr(attn, "fp8_v_scale", None)
 
         # I2V task
         hidden_states_img = None
@@ -143,12 +155,17 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
 
-            hidden_states_img = self.attention_function(query.transpose(1, 2),
-                                                        key_img.transpose(1, 2),
-                                                        value_img.transpose(1, 2),
-                                                        backend=backend,
-                                                        attention_kwargs=self.attention_kwargs,
-                                                        use_fp8_comms=use_fp8_comms).transpose(1, 2)
+            hidden_states_img = self.attention_function(
+                query.transpose(1, 2),
+                key_img.transpose(1, 2),
+                value_img.transpose(1, 2),
+                backend=backend,
+                attention_kwargs=self.attention_kwargs,
+                use_fp8_comms=use_fp8_comms,
+                fp8_q_scale=fp8_q_scale,
+                fp8_k_scale=fp8_k_scale,
+                fp8_v_scale=fp8_v_scale,
+            ).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.to(activation_dtype)
 
@@ -160,6 +177,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             use_fp8_comms=use_fp8_comms,
             attention_kwargs=self.attention_kwargs,
             head_balance_layer=attn,
+            fp8_q_scale=fp8_q_scale,
+            fp8_k_scale=fp8_k_scale,
+            fp8_v_scale=fp8_v_scale,
         ).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)
@@ -215,7 +235,7 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
            pos_embed_seq_len,
         )
         self.attention_kwargs = attention_kwargs
-        for block in self.blocks:
+        for layer_idx, block in enumerate(self.blocks):
             block.attn1.processor = xFuserWanAttnProcessor(attention_kwargs=self.attention_kwargs)
             block.attn2.processor = xFuserWanAttnProcessor(use_ulysses_parallel_attention=False, is_cross_attention=True)
             # Per-layer head permutation buffer for the Ulysses block-sparse head
@@ -227,6 +247,28 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 torch.arange(num_attention_heads, dtype=torch.long),
                 persistent=False,
             )
+            # Per-layer FP8 comms scales (updated during calibration, frozen before compile).
+            block.attn1.register_buffer(
+                "fp8_q_scale", torch.ones(1, dtype=torch.float32), persistent=False
+            )
+            block.attn1.register_buffer(
+                "fp8_k_scale", torch.ones(1, dtype=torch.float32), persistent=False
+            )
+            block.attn1.register_buffer(
+                "fp8_v_scale", torch.ones(1, dtype=torch.float32), persistent=False
+            )
+            block.attn1.register_buffer(
+                "fp8_comms_layer_idx",
+                torch.tensor([layer_idx], dtype=torch.long),
+                persistent=False,
+            )
+            block.attn1.fp8_comms_owner = self
+
+    def register_fp8_comms_state(self, fp8_comms) -> None:
+        """Register this transformer with runtime FP8 comms state (after runtime init)."""
+        if fp8_comms is None:
+            return
+        fp8_comms.register_model(self, len(self.blocks))
 
 
     def _chunk_and_pad_sequence(self, x: torch.Tensor, sp_world_rank: int, sp_world_size: int, pad_amount: int, dim: int) -> torch.Tensor:

@@ -129,15 +129,14 @@ def _fp8_comms_input_all_to_all(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
 ) -> tuple:
-    """Quantize Q/K/V to FP8 using shared scales and run interleaved input all-to-alls.
+    """Quantize Q/K/V to FP8 using per-layer scales and run interleaved input all-to-alls.
 
-    Scales start at 1.0 and are updated once per generation via all_reduce after step 1.
     Returns (query, key, value, attn_kwargs_update, (q_scale, k_scale, v_scale), qkv_amaxes).
     """
-    fp8_comms = get_runtime_state().fp8_comms
-    q_scale, k_scale, v_scale = fp8_comms.q_scale, fp8_comms.k_scale, fp8_comms.v_scale
-
     # quantize with shared synced scale so all ranks agree on encoding, then all-to-all
     q_fp8, q_descale = _per_tensor_quant(query, q_scale)
     query = _ft_c_input_all_to_all(q_fp8)
@@ -323,6 +322,9 @@ def USP(
         backend=None,
         attention_kwargs: dict | None = None,
         head_balance_layer=None,
+        fp8_q_scale: torch.Tensor | None = None,
+        fp8_k_scale: torch.Tensor | None = None,
+        fp8_v_scale: torch.Tensor | None = None,
     ):
     """
     Unified Sequence Parallelism (USP) attention call, supporting combinations of Ulysses and
@@ -400,7 +402,13 @@ def USP(
                 R = FP8_HADAMARD_MATRIX[query.device]
                 query = _fp8_hadamard_rotate(query, R).contiguous()
                 key = _fp8_hadamard_rotate(key, R).contiguous()
-            query, key, value, attn_kwargs_update, qkv_scales, qkv_amaxes = _fp8_comms_input_all_to_all(query, key, value)
+            if fp8_q_scale is None or fp8_k_scale is None or fp8_v_scale is None:
+                raise RuntimeError(
+                    "FP8 comms requires per-layer scale buffers (fp8_q_scale, fp8_k_scale, fp8_v_scale)."
+                )
+            query, key, value, attn_kwargs_update, qkv_scales, qkv_amaxes = _fp8_comms_input_all_to_all(
+                query, key, value, fp8_q_scale, fp8_k_scale, fp8_v_scale,
+            )
             attention_kwargs = (attention_kwargs or {}) | attn_kwargs_update
         elif combine_qkv_a2a and query.shape == key.shape == value.shape:
             query, key, value = _combined_qkv_all_to_all(query, key, value)

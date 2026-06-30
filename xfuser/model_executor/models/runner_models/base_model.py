@@ -256,6 +256,9 @@ class xFuserModel(abc.ABC):
 
         self._post_load_and_state_initialization(input_args)
         self._enable_options()
+        self._register_fp8_comms_models()
+        if self._needs_fp8_comms_calibration():
+            self._calibrate_fp8_comms(input_args)
 
         if self.config.use_torch_compile:
             log("Torch.compile enabled. Warming up torch compiler ...")
@@ -286,6 +289,41 @@ class xFuserModel(abc.ABC):
         elif self.config.enable_model_cpu_offload:
             log("Enabling model CPU offload...")
             self.pipe.enable_model_cpu_offload()
+
+
+    def _needs_fp8_comms_calibration(self) -> bool:
+        fp8_comms = get_runtime_state().fp8_comms
+        return fp8_comms is not None and fp8_comms.fixed_scale is None
+
+    def _register_fp8_comms_models(self) -> None:
+        fp8_comms = get_runtime_state().fp8_comms
+        if fp8_comms is None:
+            return
+        transformer = getattr(self.pipe, "transformer", None)
+        if transformer is not None and hasattr(transformer, "register_fp8_comms_state"):
+            transformer.register_fp8_comms_state(fp8_comms)
+        transformer_2 = getattr(self.pipe, "transformer_2", None)
+        if transformer_2 is not None and hasattr(transformer_2, "register_fp8_comms_state"):
+            transformer_2.register_fp8_comms_state(fp8_comms)
+        if torch.cuda.is_available():
+            fp8_comms.to_device_(torch.device("cuda", torch.cuda.current_device()))
+
+    def _calibrate_fp8_comms(self, input_args: dict) -> None:
+        """Run one throwaway pipe call to calibrate per-layer FP8 comms scales."""
+        log("Calibrating FP8 comms scales (throwaway inference pass)...")
+        calib_args = copy.deepcopy(input_args)
+        calib_args = self._split_prompts_for_dp(calib_args)
+        if self.config.batch_size and isinstance(calib_args.get("prompt"), list):
+            calib_args["prompt"] = calib_args["prompt"][: self.config.batch_size]
+        self._run_timed_pipe(calib_args)
+        runtime_state = get_runtime_state()
+        transformer = getattr(self.pipe, "transformer", None)
+        if transformer is not None:
+            runtime_state.sync_fp8_comms(transformer)
+        transformer_2 = getattr(self.pipe, "transformer_2", None)
+        if transformer_2 is not None:
+            runtime_state.sync_fp8_comms(transformer_2)
+        log("FP8 comms calibration complete.")
 
 
     def _validate_fp8_comms_config(self, config: xFuserArgs) -> None:

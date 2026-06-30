@@ -9,7 +9,6 @@ from diffusers.utils import is_torch_xla_available, logging
 import torch
 
 from xfuser.config import EngineConfig
-from xfuser.core.distributed import get_runtime_state
 from xfuser.core.distributed import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
@@ -189,9 +188,7 @@ class xFuserWanImageToVideoPipeline(WanImageToVideoPipeline):
                     current_model = self.transformer
                     current_guidance_scale = guidance_scale
                 else:
-                    # low-noise stage in wan2.2 -- reset calibration on first switch to transformer_2
-                    if current_model is not self.transformer_2:
-                        get_runtime_state().reset_fp8_comms_calibration(self.transformer_2)
+                    # low-noise stage in wan2.2
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_scale_2
 
@@ -216,9 +213,6 @@ class xFuserWanImageToVideoPipeline(WanImageToVideoPipeline):
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                     )[0]
-
-                # sync fp8_comms running max after first denoising step (pure Python, outside compiled region)
-                get_runtime_state().sync_fp8_comms(current_model)
 
                 if self.do_classifier_free_guidance:
                     if do_cfg_parallel:
