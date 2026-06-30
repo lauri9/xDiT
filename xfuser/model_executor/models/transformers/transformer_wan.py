@@ -145,6 +145,15 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         fp8_q_scale = getattr(attn, "fp8_q_scale", None)
         fp8_k_scale = getattr(attn, "fp8_k_scale", None)
         fp8_v_scale = getattr(attn, "fp8_v_scale", None)
+        fp8_kwargs = (
+            {
+                "fp8_q_scale": fp8_q_scale,
+                "fp8_k_scale": fp8_k_scale,
+                "fp8_v_scale": fp8_v_scale,
+            }
+            if use_fp8_comms
+            else {}
+        )
 
         # I2V task
         hidden_states_img = None
@@ -162,9 +171,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
                 backend=backend,
                 attention_kwargs=self.attention_kwargs,
                 use_fp8_comms=use_fp8_comms,
-                fp8_q_scale=fp8_q_scale,
-                fp8_k_scale=fp8_k_scale,
-                fp8_v_scale=fp8_v_scale,
+                **fp8_kwargs,
             ).transpose(1, 2)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.to(activation_dtype)
@@ -177,9 +184,7 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             use_fp8_comms=use_fp8_comms,
             attention_kwargs=self.attention_kwargs,
             head_balance_layer=attn,
-            fp8_q_scale=fp8_q_scale,
-            fp8_k_scale=fp8_k_scale,
-            fp8_v_scale=fp8_v_scale,
+            **fp8_kwargs,
         ).transpose(1, 2)
 
         hidden_states = hidden_states.flatten(2, 3)

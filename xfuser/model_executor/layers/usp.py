@@ -504,6 +504,9 @@ def attention(
         backend=None,
         attention_kwargs=None,
         head_balance_layer=None,
+        fp8_q_scale: torch.Tensor | None = None,
+        fp8_k_scale: torch.Tensor | None = None,
+        fp8_v_scale: torch.Tensor | None = None,
     ):
     """
     Runs attention call without any parallelism.
