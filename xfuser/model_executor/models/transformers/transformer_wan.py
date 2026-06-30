@@ -262,7 +262,9 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 torch.tensor([layer_idx], dtype=torch.long),
                 persistent=False,
             )
-            block.attn1.fp8_comms_owner = self
+            # Plain attribute (not nn.Module child) — assigning self directly would
+            # register the transformer as a submodule of attn1 and recurse forever.
+            object.__setattr__(block.attn1, "fp8_comms_owner", self)
 
     def register_fp8_comms_state(self, fp8_comms) -> None:
         """Register this transformer with runtime FP8 comms state (after runtime init)."""
