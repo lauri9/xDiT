@@ -398,6 +398,43 @@ def test_disk_filler_receives_the_exact_request_used_for_meta_build(monkeypatch)
     assert captured[0] is request
 
 
+def test_checkpoint_request_inherits_model_revision_and_cache_dir():
+    loader = object.__new__(ModelLoader)
+    loader.model = SimpleNamespace(
+        config=SimpleNamespace(
+            model_revision="5be7df9619b54f4e2667b2755bc6a756675b5cd7",
+            download_dir="/models/cache",
+        ),
+        settings=SimpleNamespace(model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers"),
+    )
+
+    request = loader.checkpoint_request("transformer_2")
+
+    assert request.revision == "5be7df9619b54f4e2667b2755bc6a756675b5cd7"
+    assert request.cache_dir == "/models/cache"
+    assert request.subfolder == "transformer_2"
+
+
+def test_checkpoint_request_revision_precedence():
+    class Model:
+        checkpoint_request_defaults = {"revision": "class-default"}
+
+        def __init__(self, configured_revision):
+            self.config = SimpleNamespace(
+                model_revision=configured_revision,
+                download_dir=None,
+            )
+            self.settings = SimpleNamespace(model_name="org/repo")
+
+    loader = object.__new__(ModelLoader)
+    loader.model = Model("configured")
+    assert loader.checkpoint_request().revision == "configured"
+    assert loader.checkpoint_request(revision="per-call").revision == "per-call"
+
+    loader.model = Model(None)
+    assert loader.checkpoint_request().revision == "class-default"
+
+
 def test_dual_meta_transformers_keep_distinct_checkpoint_requests(monkeypatch):
     loader = make_loader(monkeypatch)
     loader.load_declaration = LoadDeclaration.meta("transformer", "transformer_2", replicated=True)

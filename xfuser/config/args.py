@@ -163,6 +163,7 @@ class xFuserArgs:
 
     # Model arguments
     model: str = ""
+    model_revision: Optional[str] = None
     download_dir: Optional[str] = None
     trust_remote_code: bool = False
     lora_path: Optional[str] = None
@@ -243,6 +244,7 @@ class xFuserArgs:
     use_fp8_gemms: bool = False
     use_fp8_text_encoder: bool = False
     use_fp4_gemms: bool = False
+    ptq_artifact_path: Optional[str] = None
     # Internal compatibility bridge derived from gemm_quantization.
     use_fp6_gemms: bool = False
     use_a6w4_gemms: bool = False
@@ -464,6 +466,12 @@ class xFuserArgs:
             default="PixArt-alpha/PixArt-XL-2-1024-MS",
             help="Name or path of the huggingface model to use.",
             required=True,
+        )
+        model_group.add_argument(
+            "--model_revision",
+            type=nullable_str,
+            default=None,
+            help="Exact Hugging Face model revision or commit to load.",
         )
         model_group.add_argument(
             "--download-dir",
@@ -808,6 +816,12 @@ class xFuserArgs:
             required=True,
         )
         parser.add_argument(
+            "--model_revision",
+            type=nullable_str,
+            default=None,
+            help="Exact Hugging Face model revision or commit to load.",
+        )
+        parser.add_argument(
             "--lora_path",
             type=nullable_str,
             default=None,
@@ -1047,6 +1061,12 @@ class xFuserArgs:
             "--use_fp4_gemms",
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
+        )
+        parser.add_argument(
+            "--ptq_artifact_path",
+            type=str,
+            default=None,
+            help="Load pre-quantized MXFP4 transformer weights from this PTQ artifact.",
         )
         parser.add_argument(
             "--fp8_precision_override_prefix_patterns",

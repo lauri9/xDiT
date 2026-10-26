@@ -85,6 +85,7 @@ class CheckpointManifest:
     strict: bool = False
     label: str | None = None
     derived: Mapping[str, DerivedTensor] = field(default_factory=dict)
+    sparse_paths: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         # Every source has to sit in the shard the live key maps to. The filler keeps

@@ -375,6 +375,11 @@ class ModelLoader:
         from huggingface_hub.constants import HF_HUB_OFFLINE
 
         defaults = dict(getattr(type(self.model), "checkpoint_request_defaults", {}) or {})
+        config = getattr(self.model, "config", None)
+        configured_revision = getattr(config, "model_revision", None)
+        if configured_revision is not None:
+            defaults["revision"] = configured_revision
+        defaults.setdefault("cache_dir", getattr(config, "download_dir", None))
         defaults.setdefault("local_files_only", HF_HUB_OFFLINE)
         defaults.update(kwargs)
         return CheckpointRequest(self.model.settings.model_name, subfolder=subfolder, **defaults)
@@ -1005,15 +1010,18 @@ class ModelLoader:
         """Fill and quantize one eager meta transformer without collectives."""
 
         if quantize_fn is None:
-            from .shard import build_block_quantize_fn
+            if getattr(component, "_xfuser_prequantized_mxfp4", False):
+                quantize_fn = lambda _block, _index: None
+            else:
+                from .shard import build_block_quantize_fn
 
-            quantize_fn = build_block_quantize_fn(
-                self,
-                name,
-                strategy.get("wrap_attrs", []),
-                get_world_group().local_rank,
-                component=component,
-            )
+                quantize_fn = build_block_quantize_fn(
+                    self,
+                    name,
+                    strategy.get("wrap_attrs", []),
+                    get_world_group().local_rank,
+                    component=component,
+                )
         self._fill_blocks(
             component,
             name,
@@ -1391,6 +1399,7 @@ class _BlockwiseDiskFiller:
         self.checkpoint_keys = manifest.checkpoint_keys
         self.derived = manifest.derived
         self.strict = manifest.strict
+        self.sparse_paths = manifest.sparse_paths
         self._used_keys = set()
         self.shard_paths = set(self.weight_map.values())
         # Which keys each shard still owes, so a shard's page cache is dropped when the fill is
@@ -1548,14 +1557,15 @@ class _BlockwiseDiskFiller:
         if h is None:
             self._release_handles()
             depth = _warm_shard_depth()
-            if depth:
+            sparse_paths = getattr(self, "sparse_paths", ())
+            if depth and path not in sparse_paths:
                 # Charged as its own phase, but it happens inside a "read" span and so is counted in
                 # that total too: it is a component of the read, not a sibling of it.
                 with self._timed("warm"):
                     self._await_or_warm(path)
             h = self._stack.enter_context(safe_open(path, framework="pt", device=self._read_device()))
             self._handle_cache[path] = h
-            if depth > 1:
+            if depth > 1 and path not in sparse_paths:
                 self._prefetch_after(path)
         return h
 

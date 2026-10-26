@@ -62,6 +62,56 @@ class xFuserMXFP4Linear(nn.Module):
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
+
+    def install_packed_placeholders(
+        self,
+        *,
+        weight_shape,
+        scale_shape,
+        device=None,
+    ) -> None:
+        """Install empty final-layout tensors for a pre-quantized block fill."""
+
+        expected_weight_shape = (self.out_features, self.in_features // 2)
+        expected_scale_shape = (
+            (self.out_features + 255) // 256 * 256,
+            ((self.in_features // 32) + 7) // 8 * 8,
+        )
+        if self.in_features % 32:
+            raise ValueError("MXFP4 in_features must be divisible by 32")
+        if tuple(weight_shape) != expected_weight_shape:
+            raise ValueError(
+                f"packed MXFP4 weight shape {tuple(weight_shape)} does not match "
+                f"{expected_weight_shape}"
+            )
+        if tuple(scale_shape) != expected_scale_shape:
+            raise ValueError(
+                f"shuffled MXFP4 scale shape {tuple(scale_shape)} does not match "
+                f"{expected_scale_shape}"
+            )
+
+        target_device = device if device is not None else self.weight.device
+        packed_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+        scale_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
+        if hasattr(self, "weight_shuffle"):
+            delattr(self, "weight_shuffle")
+        if hasattr(self, "weight_scale"):
+            delattr(self, "weight_scale")
+        if self.weight is not None:
+            delattr(self, "weight")
+            self.register_parameter("weight", None)
+        self.register_parameter(
+            "weight_shuffle",
+            nn.Parameter(
+                torch.empty(weight_shape, dtype=packed_dtype, device=target_device),
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer(
+            "weight_scale",
+            torch.empty(scale_shape, dtype=scale_dtype, device=target_device),
+            persistent=True,
+        )
     
     def load_and_quantize_weights(
         self, 

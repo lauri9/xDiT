@@ -727,6 +727,33 @@ def test_a_shard_is_streamed_in_before_it_is_mapped(runtime, monkeypatch):
     assert warmed == ["shard-a", "shard-b"]
 
 
+def test_sparse_overlay_shard_is_mapped_without_streaming_whole_file(runtime, monkeypatch):
+    warmed = []
+    monkeypatch.setenv("XDIT_WARM_SHARDS", "2")
+    monkeypatch.setattr(runtime.meta, "warm_file_page_cache", lambda path: warmed.append(path))
+    import safetensors
+
+    monkeypatch.setattr(safetensors, "safe_open", lambda *a, **k: nullcontext("handle"))
+
+    filler = object.__new__(runtime.meta._BlockwiseDiskFiller)
+    filler._used_keys = set()
+    filler.device = "cpu"
+    filler._handle_cache = {}
+    filler._stack = ExitStack()
+    filler.sparse_paths = frozenset({"bf16-shard"})
+    filler._next_shard = {"bf16-shard": "artifact-shard"}
+    filler._unread_by_shard = {
+        "bf16-shard": {"linear.bias"},
+        "artifact-shard": {"linear.weight_shuffle"},
+    }
+    filler._streamed = set()
+    filler._prefetch_thread = None
+
+    filler._handle("bf16-shard")
+
+    assert warmed == []
+
+
 def _prefetch_filler(runtime, monkeypatch, warmed, order, unread=None):
     """A filler wired to record warms instead of touching disk."""
     import safetensors

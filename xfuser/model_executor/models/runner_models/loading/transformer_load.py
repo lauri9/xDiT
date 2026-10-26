@@ -21,7 +21,7 @@ from .blockwise_ownership import (
     blockwise_transformer_descriptor,
     record_blockwise_ownership,
 )
-from .checkpoint import CheckpointManifest, CheckpointRequest
+from .checkpoint import CheckpointManifest, CheckpointRequest, discover_checkpoint
 from .contracts import UnsupportedLoadContract
 
 
@@ -71,6 +71,55 @@ def _resolve_request(loader, subfolder, checkpoint_request):
     if request.subfolder is None:
         return request.with_subfolder("transformer")
     return request
+
+
+def _prequantized_source(loader, request, weight_source):
+    config = getattr(loader.model, "config", None)
+    artifact_path = getattr(config, "ptq_artifact_path", None)
+    if not artifact_path:
+        return weight_source, ()
+    if weight_source is not None:
+        raise UnsupportedLoadContract(
+            "ptq_artifact_path cannot be combined with another mapped checkpoint source"
+        )
+    if not config.use_fp4_gemms:
+        raise UnsupportedLoadContract("ptq_artifact_path requires use_fp4_gemms")
+    if not request.revision:
+        raise UnsupportedLoadContract("ptq_artifact_path requires an exact model revision")
+
+    from xfuser.model_executor.quant.ptq.artifact import load_artifact
+    from xfuser.model_executor.quant.ptq.prequantized_load import (
+        compose_prequantized_manifest,
+    )
+
+    artifact = getattr(loader, "_ptq_artifact", None)
+    if artifact is None:
+        artifact = load_artifact(
+            artifact_path,
+            expected_source_revision=request.revision,
+        )
+        loader._ptq_artifact = artifact
+        log(f"Validated PTQ artifact {artifact.artifact_id}")
+    specs = artifact.specs_for_component(request.subfolder)
+    if not specs:
+        raise UnsupportedLoadContract(
+            f"PTQ artifact {artifact.artifact_id} has no layers for {request.subfolder}"
+        )
+    return compose_prequantized_manifest(
+        discover_checkpoint(request),
+        artifact_path=None,
+        specs=specs,
+    ), specs
+
+
+def _install_prequantized_layout(component, specs):
+    if specs:
+        from xfuser.model_executor.quant.ptq.prequantized_load import (
+            install_prequantized_mxfp4_layout,
+        )
+
+        install_prequantized_mxfp4_layout(component, specs)
+    return component
 
 
 def _prepare_native_load(model, adapter, component_name, targets, stream_quant, model_factory):
@@ -166,6 +215,26 @@ def load_transformer(
     ledger = loader.quantization_ledger
     request = _resolve_request(loader, subfolder, checkpoint_request)
     component_name = request.subfolder
+    weight_source, prequantized_specs = _prequantized_source(
+        loader,
+        request,
+        weight_source,
+    )
+    if prequantized_specs:
+        if get_world_group().world_size != 1:
+            raise UnsupportedLoadContract(
+                "pre-quantized MXFP4 loading currently supports a single rank"
+            )
+        component = loader.build_meta_transformer(
+            wrapper_cls,
+            request,
+            init_kwargs,
+            weight_source=weight_source,
+        )
+        _install_prequantized_layout(component, prequantized_specs)
+        component._xfuser_prequantized_mxfp4 = True
+        loader.mark_local_blockwise(component)
+        return component
     adapter, targets = loader.transformer_quantization_adapter(component_name)
     targets = tuple(targets)
     strategy = model.settings.fsdp_strategy.get(component_name, {})
@@ -188,7 +257,10 @@ def load_transformer(
                 blockwise_transformer_descriptor(adapter, component_name, targets, wrap_attrs),
                 **_fp4_remainder(loader, component_name),
             )
-        return loader.build_meta_transformer(wrapper_cls, request, init_kwargs, **build_kwargs)
+        component = loader.build_meta_transformer(
+            wrapper_cls, request, init_kwargs, **build_kwargs
+        )
+        return _install_prequantized_layout(component, prequantized_specs)
 
     quantization_config = None
     if adapter is not None:
@@ -212,6 +284,7 @@ def load_transformer(
                 **_fp4_remainder(loader, component_name),
             )
             component = loader.build_meta_transformer(wrapper_cls, request, init_kwargs, **build_kwargs)
+            _install_prequantized_layout(component, prequantized_specs)
             loader.mark_local_blockwise(component)
             return component
         if weight_source is not None:

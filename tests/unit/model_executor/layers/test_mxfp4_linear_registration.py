@@ -58,6 +58,45 @@ def test_quantized_weight_is_non_trainable_parameter_and_scale_is_buffer(
     assert layer.weight_scale.device.type == "meta"
 
 
+def test_prequantized_placeholder_has_final_layout_and_preserves_bias(runtime):
+    layer = runtime.module.xFuserMXFP4Linear(
+        64,
+        33,
+        bias=True,
+        device="meta",
+        dtype=runtime.torch.bfloat16,
+    )
+
+    layer.install_packed_placeholders(
+        weight_shape=(33, 32),
+        scale_shape=(256, 8),
+    )
+
+    assert layer.weight is None
+    assert layer.weight_shuffle.shape == (33, 32)
+    assert layer.weight_shuffle.device.type == "meta"
+    assert not layer.weight_shuffle.requires_grad
+    assert layer.weight_scale.shape == (256, 8)
+    assert layer.weight_scale.device.type == "meta"
+    assert layer.bias.shape == (33,)
+    assert layer.bias.dtype == runtime.torch.bfloat16
+
+
+def test_prequantized_placeholder_rejects_wrong_layout(runtime):
+    layer = runtime.module.xFuserMXFP4Linear(64, 33, bias=False)
+
+    with pytest.raises(ValueError, match="weight shape"):
+        layer.install_packed_placeholders(
+            weight_shape=(33, 64),
+            scale_shape=(256, 8),
+        )
+    with pytest.raises(ValueError, match="scale shape"):
+        layer.install_packed_placeholders(
+            weight_shape=(33, 32),
+            scale_shape=(33, 2),
+        )
+
+
 def test_forward_uses_registered_quantized_parameter_without_aiter_kernel(
     runtime,
     fake_aiter_quantization,
