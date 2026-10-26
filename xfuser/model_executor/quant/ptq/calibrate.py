@@ -1,4 +1,4 @@
-"""Eager-BF16 Wan 2.2 calibration entry point."""
+"""Eager-BF16 Wan 2.2 calibration entry point using AITER MHA v4."""
 
 from __future__ import annotations
 
@@ -35,8 +35,8 @@ class CalibrationSettings:
     flow_shift: float = 3.0
     boundary_ratio: float = 0.875
     base_seed: int = 42
-    attention_backend: str = "aiter"
-    cross_attention_backend: str = "aiter"
+    attention_backend: str = "AITER_BF16"
+    cross_attention_backend: str = "AITER_BF16"
     token_sample_rate: float = 1.0
     tokens_per_forward: int | None = None
     max_prompts: int | None = None
@@ -172,6 +172,18 @@ def preflight_eager_bf16(model, settings: CalibrationSettings) -> None:
         raise RuntimeError(f"calibration has non-DP parallelism: {degrees}")
     if config.model_revision != settings.model_revision:
         raise RuntimeError("calibration source revision changed during setup")
+    attention = {
+        "self": config.attention_backend,
+        "cross": config.cross_attention_backend,
+    }
+    expected_attention = {
+        "self": settings.attention_backend,
+        "cross": settings.cross_attention_backend,
+    }
+    if attention != expected_attention:
+        raise RuntimeError(
+            f"calibration attention backend changed during setup: {attention}"
+        )
     if not hasattr(model.pipe, "transformer") or not hasattr(model.pipe, "transformer_2"):
         raise RuntimeError("Wan 2.2 calibration requires both denoising experts")
 

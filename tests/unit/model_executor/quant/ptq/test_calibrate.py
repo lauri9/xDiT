@@ -44,6 +44,8 @@ def test_eager_bf16_args_disable_quantization_compile_cache_and_parallelism(tmp_
     args = build_eager_bf16_args(settings, world_size=8)
 
     assert args.model_revision == settings.model_revision
+    assert args.attention_backend == "AITER_BF16"
+    assert args.cross_attention_backend == "AITER_BF16"
     assert args.data_parallel_degree == 8
     assert args.ulysses_degree == args.ring_degree == args.tensor_parallel_degree == 1
     assert args.pipefusion_parallel_degree == args.fully_shard_degree == 1
