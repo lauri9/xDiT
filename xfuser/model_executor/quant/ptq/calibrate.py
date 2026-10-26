@@ -1,4 +1,4 @@
-"""Eager-BF16 Wan 2.2 calibration entry point using AITER MHA v4."""
+"""Eager-BF16 Wan 2.2 calibration with the target attention recipe."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class CalibrationSettings:
     flow_shift: float = 3.0
     boundary_ratio: float = 0.875
     base_seed: int = 42
-    attention_backend: str = "AITER_BF16"
+    attention_backend: str = "AITER_MXFP4"
     cross_attention_backend: str = "AITER_BF16"
     token_sample_rate: float = 1.0
     tokens_per_forward: int | None = None
