@@ -262,11 +262,13 @@ class xFuserWan21I2VModel(xFuserWanModel):
             init_kwargs={"attention_kwargs": _build_attention_kwargs(self.config)},
         )
         te_kwargs, te_quant = self.loader.plan_text_encoders()
+        request = self.loader.checkpoint_request()
         pipe = xFuserWanImageToVideoPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=request.model_name_or_path,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
             quantization_config=te_quant,
+            **request.from_pretrained_kwargs(include_subfolder=False),
             **te_kwargs,
         )
         return pipe
@@ -408,12 +410,14 @@ class xFuserWan22I2VModel(xFuserWan21I2VModel):
             xFuserWanTransformer3DWrapper, subfolder="transformer_2", init_kwargs=attn_kwargs
         )
         te_kwargs, te_quant = self.loader.plan_text_encoders()
+        request = self.loader.checkpoint_request()
         pipe = xFuserWanImageToVideoPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=request.model_name_or_path,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
             transformer_2=transformer_2,
             quantization_config=te_quant,
+            **request.from_pretrained_kwargs(include_subfolder=False),
             **te_kwargs,
         )
         return pipe
@@ -544,6 +548,7 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
             self.config.distilled_transformer_2_path,
         )
         te_kwargs, te_quant = self.loader.plan_text_encoders()
+        request = self.loader.checkpoint_request()
         pipe = xFuserWanImageToVideoPipeline.from_pretrained(
             pretrained_model_name_or_path=self._BASE_MODEL,
             torch_dtype=torch.bfloat16,
@@ -551,6 +556,7 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
             transformer_2=transformer_2,
             boundary_ratio=self._BOUNDARY_RATIO,
             quantization_config=te_quant,
+            **request.from_pretrained_kwargs(include_subfolder=False),
             **te_kwargs,
         )
         pipe.scheduler = _DistilledWanScheduler.from_config(pipe.scheduler.config)
@@ -710,11 +716,13 @@ class xFuserWan21T2VModel(xFuserWanModel):
             init_kwargs={"attention_kwargs": _build_attention_kwargs(self.config)},
         )
         te_kwargs, te_quant = self.loader.plan_text_encoders()
+        request = self.loader.checkpoint_request()
         pipe = WanPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=request.model_name_or_path,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
             quantization_config=te_quant,
+            **request.from_pretrained_kwargs(include_subfolder=False),
             **te_kwargs,
         )
         return pipe
@@ -858,12 +866,14 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
             xFuserWanTransformer3DWrapper, subfolder="transformer_2", init_kwargs=attn_kwargs
         )
         te_kwargs, te_quant = self.loader.plan_text_encoders()
+        request = self.loader.checkpoint_request()
         pipe = WanPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=request.model_name_or_path,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
             transformer_2=transformer_2,
             quantization_config=te_quant,
+            **request.from_pretrained_kwargs(include_subfolder=False),
             **te_kwargs,
         )
         return pipe
@@ -974,11 +984,13 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
 
         pipe_class = xFuserWanImageToVideoPipeline if self.config.task == "i2v" else WanPipeline
         te_kwargs, te_quant = self.loader.plan_text_encoders()
+        request = self.loader.checkpoint_request()
         pipe = pipe_class.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=request.model_name_or_path,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
             quantization_config=te_quant,
+            **request.from_pretrained_kwargs(include_subfolder=False),
             **te_kwargs,
         )
         return pipe
@@ -1116,11 +1128,13 @@ class xFuserWan21VACEModel(xFuserWanModel):
 
         transformer = self.loader.load_transformer(xFuserWanVACETransformer3DWrapper)
         te_kwargs, te_quant = self.loader.plan_text_encoders()
+        request = self.loader.checkpoint_request()
         pipe = WanVACEPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
+            pretrained_model_name_or_path=request.model_name_or_path,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
             quantization_config=te_quant,
+            **request.from_pretrained_kwargs(include_subfolder=False),
             **te_kwargs,
         )
         return pipe
