@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import statistics
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,12 +30,21 @@ from .calibrate import (
 )
 from .mxfp4_ref import dequantize_mxfp4, quantize_mxfp4
 from .attn_mxfp4_ref import mxfp4_attention_decomposition
+from .attn_transforms import load_attention_artifact
 from .provenance import runtime_manifest
+
+
+REGISTERED_VARIANTS = ("t1", "t2", "t1+t2", "t1+t2+t3")
 
 
 @lru_cache(maxsize=4)
 def _validated_artifact(path: str):
     return load_artifact(path, expected_source_revision=MODEL_REVISION)
+
+
+@lru_cache(maxsize=8)
+def _validated_attention_artifact(path: str):
+    return load_attention_artifact(path, expected_source_revision=MODEL_REVISION)
 
 
 def _tensor_output(output) -> torch.Tensor:
@@ -309,7 +319,29 @@ class AttentionDecompositionHooks:
         return self.rows
 
 
-def _eval_args(arm: str, artifact_path: Path | None):
+def _eval_args(
+    arm: str,
+    artifact_path: Path | None,
+    *,
+    gemm_mode: str | None = None,
+    attention_artifact_path: Path | None = None,
+):
+    legacy_gemm_mode = {
+        "bf16": "bf16",
+        "rtn": "rtn",
+        "ptq": "ptq",
+        "attn_bf16": "bf16",
+        "attn_mxfp4": "bf16",
+    }[arm]
+    if gemm_mode is None:
+        gemm_mode = legacy_gemm_mode
+    elif arm in ("bf16", "rtn", "ptq") and gemm_mode != legacy_gemm_mode:
+        raise ValueError(
+            f"legacy {arm} arm requires gemm mode {legacy_gemm_mode}; "
+            "use an attention arm to vary GEMMs"
+        )
+    if gemm_mode not in ("bf16", "rtn", "ptq"):
+        raise ValueError(f"unsupported GEMM mode: {gemm_mode}")
     attention_backend = {
         "attn_bf16": "AITER_BF16",
         "attn_mxfp4": "AITER_MXFP4",
@@ -321,20 +353,57 @@ def _eval_args(arm: str, artifact_path: Path | None):
     args = build_eager_bf16_args(
         settings,
         1,
-        gemm_quantization="fp4" if arm in ("rtn", "ptq") else None,
+        gemm_quantization="fp4" if gemm_mode in ("rtn", "ptq") else None,
         ptq_artifact_path=(
-            str(artifact_path) if arm == "ptq" and artifact_path else None
+            str(artifact_path) if gemm_mode == "ptq" and artifact_path else None
+        ),
+        ptq_attention_artifact_path=(
+            str(attention_artifact_path) if attention_artifact_path else None
         ),
     )
     args.output_type = "latent"
-    if arm == "ptq":
+    if gemm_mode == "ptq":
         if artifact_path is None:
-            raise ValueError("the PTQ arm requires --artifact")
+            raise ValueError("the PTQ GEMM mode requires --artifact")
     return args
 
 
-def _callback(latents: list[torch.Tensor], forced: list[torch.Tensor] | None):
+class StepTimer:
+    """Record synchronized callback-to-callback intervals, excluding warmup."""
+
+    def __init__(self):
+        self._last: float | None = None
+        self.intervals_s: list[float] = []
+
+    def mark(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        now = time.perf_counter()
+        if self._last is not None:
+            self.intervals_s.append(now - self._last)
+        self._last = now
+
+    def report(self) -> dict:
+        return {
+            "definition": "synchronized callback intervals after step 0",
+            "values_s": self.intervals_s,
+            "mean_s": (
+                statistics.fmean(self.intervals_s) if self.intervals_s else None
+            ),
+            "median_s": (
+                statistics.median(self.intervals_s) if self.intervals_s else None
+            ),
+        }
+
+
+def _callback(
+    latents: list[torch.Tensor],
+    forced: list[torch.Tensor] | None,
+    timer: StepTimer | None = None,
+):
     def callback(_pipe, step, _timestep, callback_kwargs):
+        if timer is not None:
+            timer.mark()
         current = callback_kwargs["latents"]
         latents.append(current.detach().cpu())
         if forced is not None:
@@ -354,6 +423,9 @@ def run_arm(
     fixed_latent_path: Path,
     output_root: Path,
     artifact_path: Path | None,
+    attention_artifact_path: Path | None = None,
+    variant_label: str | None = None,
+    gemm_mode: str | None = None,
     reference_dir: Path | None,
     max_prompts: int,
     prompt_offset: int,
@@ -378,11 +450,33 @@ def run_arm(
     if len(prompts) < max_prompts:
         raise ValueError("not enough held-out prompts after excluding calibration prompts")
     assert_no_prompt_overlap(calibration_prompts, prompts)
-    if attention_decomposition and (arm != "attn_bf16" or len(prompts) != 1):
+    if attention_decomposition and (
+        arm not in ("attn_bf16", "attn_mxfp4") or len(prompts) != 1
+    ):
         raise ValueError(
-            "attention decomposition requires one attn_bf16 reference prompt"
+            "attention decomposition requires one attention-arm prompt"
         )
-    args = _eval_args(arm, artifact_path)
+    args = _eval_args(
+        arm,
+        artifact_path,
+        gemm_mode=gemm_mode,
+        attention_artifact_path=attention_artifact_path,
+    )
+    resolved_gemm_mode = (
+        "ptq"
+        if args.ptq_artifact_path
+        else "rtn"
+        if args.gemm_quantization_spec.is_pure("fp4")
+        else "bf16"
+    )
+    if variant_label is None:
+        variant_label = (
+            "plain"
+            if attention_artifact_path is None
+            else _validated_attention_artifact(
+                str(attention_artifact_path)
+            ).artifact_id
+        )
     model = MODEL_REGISTRY[MODEL_ID](args)
     input_args = {
         "height": 720,
@@ -404,6 +498,12 @@ def run_arm(
     run_payload = {
         "arm": arm,
         "artifact_id": None,
+        "gemm_mode": resolved_gemm_mode,
+        "variant_label": variant_label,
+        "attention_artifact_id": None,
+        "attention_artifact_path": (
+            str(attention_artifact_path) if attention_artifact_path else None
+        ),
         "model": MODEL_ID,
         "model_revision": MODEL_REVISION,
         "prompts_sha256": hashlib.sha256(prompts_path.read_bytes()).hexdigest(),
@@ -417,6 +517,11 @@ def run_arm(
     if artifact_path:
         artifact = _validated_artifact(str(artifact_path))
         run_payload["artifact_id"] = artifact.artifact_id
+    if attention_artifact_path:
+        attention_artifact = _validated_attention_artifact(
+            str(attention_artifact_path)
+        )
+        run_payload["attention_artifact_id"] = attention_artifact.artifact_id
     digest = hashlib.sha256(
         json.dumps(run_payload, sort_keys=True).encode()
     ).hexdigest()[:12]
@@ -449,6 +554,9 @@ def run_arm(
                 forced = reference["latents"]
             trace = TraceHooks(model.pipe)
             latents = []
+            timer = StepTimer()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
             generator = torch.Generator(
                 device=model.pipe._execution_device
             ).manual_seed(42 + prompt_index)
@@ -466,9 +574,14 @@ def run_arm(
                 output_type=(
                     "latent" if force_reference_trajectory else "np"
                 ),
-                callback_on_step_end=_callback(latents, forced),
+                callback_on_step_end=_callback(latents, forced, timer),
                 callback_on_step_end_tensor_inputs=["latents"],
             )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                peak_memory_bytes = torch.cuda.max_memory_allocated()
+            else:
+                peak_memory_bytes = None
             trace.remove()
             if not force_reference_trajectory:
                 frames = output.frames if hasattr(output, "frames") else output[0]
@@ -488,7 +601,15 @@ def run_arm(
                 output_dir / f"prompt-{prompt_index:03d}.pt",
             )
             run_payload["prompts"].append(
-                {"index": prompt_index, "text": prompt, "seed": 42 + prompt_index}
+                {
+                    "index": prompt_index,
+                    "text": prompt,
+                    "seed": 42 + prompt_index,
+                    "performance": {
+                        "steady_step_time": timer.report(),
+                        "peak_device_memory_bytes": peak_memory_bytes,
+                    },
+                }
             )
     finally:
         if layer_hook is not None:
@@ -594,6 +715,23 @@ def _ssim_frames(reference: torch.Tensor, candidate: torch.Tensor) -> float:
     return value.mean().item()
 
 
+def _decomposition_metrics(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    by_arm = defaultdict(list)
+    for row in rows:
+        for arm, metrics in row["errors"].items():
+            by_arm[arm].append(metrics["relative_mse"])
+    return {
+        "path": str(path),
+        "measurements": len(rows),
+        "relative_mse": {
+            arm: _distribution(values) for arm, values in sorted(by_arm.items())
+        },
+    }
+
+
 def compare_runs(reference_dir: Path, arm_dirs: list[Path], output: Path) -> dict:
     reference_manifest = json.loads(
         (reference_dir / "manifest.json").read_text(encoding="utf-8")
@@ -632,12 +770,34 @@ def compare_runs(reference_dir: Path, arm_dirs: list[Path], output: Path) -> dic
     for arm_dir in arm_dirs:
         manifest = json.loads((arm_dir / "manifest.json").read_text(encoding="utf-8"))
         mode = "forced" if manifest["force_reference_trajectory"] else "free"
-        grouped[manifest["arm"]][mode] = (arm_dir, manifest)
-    for arm, modes in grouped.items():
+        label = manifest["arm"]
+        if manifest.get("attention_artifact_id"):
+            label = manifest.get("variant_label") or manifest["attention_artifact_id"]
+        gemm_mode = manifest.get(
+            "gemm_mode",
+            {"rtn": "rtn", "ptq": "ptq"}.get(manifest["arm"], "bf16"),
+        )
+        key = (label, gemm_mode, manifest["arm"])
+        if mode in grouped[key]:
+            raise ValueError(f"duplicate {mode} run for {key}")
+        grouped[key][mode] = (arm_dir, manifest)
+    for (label, gemm_mode, arm), modes in grouped.items():
         if "forced" not in modes or "free" not in modes:
-            raise ValueError(f"{arm} requires both forced and free trajectory runs")
+            raise ValueError(
+                f"{label}/{gemm_mode}/{arm} requires both forced and free "
+                "trajectory runs"
+            )
         forced_dir, forced_manifest = modes["forced"]
         free_dir, free_manifest = modes["free"]
+        if (
+            forced_manifest.get("attention_artifact_id")
+            != free_manifest.get("attention_artifact_id")
+            or forced_manifest.get("variant_label")
+            != free_manifest.get("variant_label")
+        ):
+            raise ValueError(
+                f"{label}/{gemm_mode}/{arm} forced/free provenance mismatch"
+            )
         prompts = []
         for prompt in reference_manifest["prompts"]:
             index = prompt["index"]
@@ -710,10 +870,29 @@ def compare_runs(reference_dir: Path, arm_dirs: list[Path], output: Path) -> dic
                     },
                 }
             )
-        result["arms"][arm] = {
+        output_label = label
+        if output_label in result["arms"]:
+            output_label = f"{label}@{gemm_mode}"
+        result["arms"][output_label] = {
             "forced_run": str(forced_dir),
             "free_run": str(free_dir),
             "artifact_id": free_manifest.get("artifact_id"),
+            "attention_artifact_id": free_manifest.get("attention_artifact_id"),
+            "variant_label": free_manifest.get("variant_label", label),
+            "gemm_mode": gemm_mode,
+            "attention_backend": free_manifest.get("attention_backend"),
+            "arm": free_manifest["arm"],
+            "performance": [
+                prompt.get("performance") for prompt in free_manifest["prompts"]
+            ],
+            "attention_emulator_decomposition": (
+                _decomposition_metrics(
+                    forced_dir / "attention-decomposition.json"
+                )
+                or _decomposition_metrics(
+                    free_dir / "attention-decomposition.json"
+                )
+            ),
             "prompts": prompts,
         }
     if "rtn" in result["arms"] and "ptq" in result["arms"]:
@@ -749,15 +928,298 @@ def compare_runs(reference_dir: Path, arm_dirs: list[Path], output: Path) -> dic
                 )
             gaps.append(entry)
         result["gap_closed"] = gaps
+
+    # Stage 3 compares every transformed MXFP4-attention candidate with the
+    # untransformed MXFP4-attention run using the identical GEMM mode.
+    plain_by_gemm = {}
+    for label, arm_result in result["arms"].items():
+        if (
+            arm_result["arm"] == "attn_mxfp4"
+            and arm_result["attention_artifact_id"] is None
+        ):
+            key = (arm_result["gemm_mode"], arm_result["artifact_id"])
+            if key in plain_by_gemm:
+                raise ValueError(f"duplicate plain MXFP4 comparator for {key}")
+            plain_by_gemm[key] = arm_result
+    candidate_gaps = []
+    for label, arm_result in result["arms"].items():
+        if (
+            arm_result["arm"] != "attn_mxfp4"
+            or arm_result["attention_artifact_id"] is None
+        ):
+            continue
+        comparator_key = (arm_result["gemm_mode"], arm_result["artifact_id"])
+        comparator = plain_by_gemm.get(comparator_key)
+        if comparator is None:
+            raise ValueError(
+                f"{label} has no plain MXFP4 comparator with GEMM mode "
+                f"{arm_result['gemm_mode']} and GEMM artifact "
+                f"{arm_result['artifact_id']}"
+            )
+        if len(comparator["prompts"]) != len(arm_result["prompts"]):
+            raise ValueError("candidate/comparator prompt-count mismatch")
+        prompt_gaps = []
+        for plain_prompt, candidate_prompt in zip(
+            comparator["prompts"], arm_result["prompts"]
+        ):
+            if plain_prompt["index"] != candidate_prompt["index"]:
+                raise ValueError("candidate/comparator prompt mismatch")
+            rung3 = {}
+            for expert in ("transformer", "transformer_2"):
+                baseline = plain_prompt["rung3"]["velocity"][expert][
+                    "cfg_combined"
+                ]["relative_mse"]
+                candidate = candidate_prompt["rung3"]["velocity"][expert][
+                    "cfg_combined"
+                ]["relative_mse"]
+                rung3[expert] = (baseline - candidate) / max(baseline, 1.0e-30)
+            rung3["equal_mean"] = statistics.fmean(rung3.values())
+            baseline_final = plain_prompt["rung4"]["latent_drift"][-1][
+                "relative_mse"
+            ]
+            candidate_final = candidate_prompt["rung4"]["latent_drift"][-1][
+                "relative_mse"
+            ]
+            prompt_gaps.append(
+                {
+                    "index": plain_prompt["index"],
+                    "rung3": rung3,
+                    "rung4": {
+                        "final_latent": (
+                            (baseline_final - candidate_final)
+                            / max(baseline_final, 1.0e-30)
+                        )
+                    },
+                }
+            )
+        candidate_gaps.append(
+            {
+                "variant_label": arm_result["variant_label"],
+                "attention_artifact_id": arm_result["attention_artifact_id"],
+                "gemm_mode": arm_result["gemm_mode"],
+                "comparator": "plain_mxfp4",
+                "prompts": prompt_gaps,
+            }
+        )
+    if candidate_gaps:
+        result["candidate_gap_closed"] = candidate_gaps
+
+    t0 = []
+    for label, arm_result in result["arms"].items():
+        if (
+            arm_result["arm"] != "attn_bf16"
+            or arm_result["attention_artifact_id"] is None
+        ):
+            continue
+        prompts = []
+        for prompt in arm_result["prompts"]:
+            block_metrics = prompt["rung2"]["propagated_blocks"]
+            velocity_metrics = prompt["rung3"]["velocity"]
+            measured = [
+                *block_metrics.values(),
+                *(
+                    velocity_metrics[expert]["cfg_combined"]
+                    for expert in ("transformer", "transformer_2")
+                ),
+            ]
+            max_relative_mse = max(row["relative_mse"] for row in measured)
+            min_cosine = min(row["cosine_similarity"] for row in measured)
+            prompts.append(
+                {
+                    "index": prompt["index"],
+                    "max_relative_mse": max_relative_mse,
+                    "min_cosine_similarity": min_cosine,
+                    "passes": max_relative_mse <= 1.0e-4 and min_cosine >= 0.999,
+                }
+            )
+        t0.append(
+            {
+                "variant_label": arm_result["variant_label"],
+                "attention_artifact_id": arm_result["attention_artifact_id"],
+                "gemm_mode": arm_result["gemm_mode"],
+                "tolerance": {
+                    "max_relative_mse": 1.0e-4,
+                    "min_cosine_similarity": 0.999,
+                },
+                "prompts": prompts,
+                "passes": all(prompt["passes"] for prompt in prompts),
+            }
+        )
+    if t0:
+        result["function_preservation"] = t0
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return result
+
+
+def _distribution(values: list[float]) -> dict:
+    return {
+        "mean": statistics.fmean(values),
+        "median": statistics.median(values),
+        "values": values,
+    }
+
+
+def _aggregate_stage3_reports(
+    reports: list[dict], report_paths: list[Path], output: Path
+) -> dict:
+    grouped: dict[tuple[str, str], dict] = {}
+    function_preservation = defaultdict(list)
+    for report in reports:
+        for candidate in report.get("function_preservation", []):
+            key = (candidate["gemm_mode"], candidate["variant_label"])
+            function_preservation[key].extend(candidate["prompts"])
+        for candidate in report.get("candidate_gap_closed", []):
+            key = (candidate["gemm_mode"], candidate["variant_label"])
+            entry = grouped.setdefault(
+                key,
+                {
+                    "artifact_ids": set(),
+                    "rung3": defaultdict(list),
+                    "rung4": [],
+                    "step_times": [],
+                    "peak_memory": [],
+                    "decomposition": defaultdict(list),
+                },
+            )
+            entry["artifact_ids"].add(candidate["attention_artifact_id"])
+            for prompt in candidate["prompts"]:
+                for expert in ("transformer", "transformer_2", "equal_mean"):
+                    entry["rung3"][expert].append(prompt["rung3"][expert])
+                entry["rung4"].append(prompt["rung4"]["final_latent"])
+            for arm in report["arms"].values():
+                if (
+                    arm.get("gemm_mode") == candidate["gemm_mode"]
+                    and arm.get("variant_label") == candidate["variant_label"]
+                ):
+                    decomposition = arm.get("attention_emulator_decomposition")
+                    if decomposition:
+                        for name, metrics in decomposition[
+                            "relative_mse"
+                        ].items():
+                            entry["decomposition"][name].extend(
+                                metrics["values"]
+                            )
+                    for performance in arm.get("performance", []):
+                        if not performance:
+                            continue
+                        mean = performance["steady_step_time"].get("mean_s")
+                        if mean is not None:
+                            entry["step_times"].append(mean)
+                        peak = performance.get("peak_device_memory_bytes")
+                        if peak is not None:
+                            entry["peak_memory"].append(peak)
+
+    variants = {}
+    for (gemm_mode, variant_label), entry in sorted(grouped.items()):
+        variants.setdefault(gemm_mode, {})[variant_label] = {
+            "attention_artifact_ids": sorted(entry["artifact_ids"]),
+            "prompt_count": len(entry["rung4"]),
+            "gap_closed": {
+                "rung3": {
+                    expert: _distribution(entry["rung3"][expert])
+                    for expert in ("transformer", "transformer_2", "equal_mean")
+                },
+                "rung4": {"final_latent": _distribution(entry["rung4"])},
+            },
+            "performance": {
+                "steady_step_time_s": (
+                    _distribution(entry["step_times"])
+                    if entry["step_times"]
+                    else None
+                ),
+                "peak_device_memory_bytes": (
+                    _distribution(entry["peak_memory"])
+                    if entry["peak_memory"]
+                    else None
+                ),
+            },
+            "attention_emulator_decomposition": {
+                name: _distribution(values)
+                for name, values in sorted(entry["decomposition"].items())
+            },
+        }
+
+    selections = {}
+    for gemm_mode, mode_variants in variants.items():
+        eligible = [
+            label for label in REGISTERED_VARIANTS if label in mode_variants
+        ]
+        if len(eligible) != len(REGISTERED_VARIANTS):
+            selections[gemm_mode] = {
+                "status": "incomplete",
+                "rule": (
+                    "run all four registered variants before selection"
+                ),
+                "eligible_variants": eligible,
+                "missing_variants": [
+                    label for label in REGISTERED_VARIANTS
+                    if label not in mode_variants
+                ],
+            }
+            continue
+        selected = max(
+            eligible,
+            key=lambda label: (
+                mode_variants[label]["gap_closed"]["rung3"]["equal_mean"]["mean"],
+                mode_variants[label]["gap_closed"]["rung4"]["final_latent"]["mean"],
+            ),
+        )
+        power_of_two_variant = (
+            f"{selected}-pow2"
+            if "t3" in selected
+            else f"{selected}+t3-pow2"
+        )
+        selections[gemm_mode] = {
+            "status": "selected",
+            "rule": (
+                "maximize equal-weight mean rung-3 gap closed; "
+                "break ties by mean final-latent rung-4 gap closed"
+            ),
+            "eligible_variants": eligible,
+            "selected_variant": selected,
+            "power_of_two_followup_variant": power_of_two_variant,
+        }
+
+    function_summary = {}
+    for (gemm_mode, variant_label), prompts in sorted(
+        function_preservation.items()
+    ):
+        function_summary.setdefault(gemm_mode, {})[variant_label] = {
+            "prompt_count": len(prompts),
+            "max_relative_mse": max(
+                prompt["max_relative_mse"] for prompt in prompts
+            ),
+            "min_cosine_similarity": min(
+                prompt["min_cosine_similarity"] for prompt in prompts
+            ),
+            "passes": all(prompt["passes"] for prompt in prompts),
+        }
+
+    summary = {
+        "reports": [str(path) for path in report_paths],
+        "registered_variants": list(REGISTERED_VARIANTS),
+        "variants_by_gemm_mode": variants,
+        "selection_by_gemm_mode": selections,
+        "function_preservation_by_gemm_mode": function_summary,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return summary
 
 
 def aggregate_reports(report_paths: list[Path], output: Path) -> dict:
     reports = [
         json.loads(path.read_text(encoding="utf-8")) for path in report_paths
     ]
+    if any(
+        "candidate_gap_closed" in report or "function_preservation" in report
+        for report in reports
+    ):
+        return _aggregate_stage3_reports(reports, report_paths, output)
     gaps = [report["gap_closed"][0] for report in reports]
 
     def mean_at(path):
@@ -983,6 +1445,9 @@ def _parse_args():
     run.add_argument("--fixed-latent", type=Path, required=True)
     run.add_argument("--output-root", type=Path, default=Path("/data/ptq/eval"))
     run.add_argument("--artifact", type=Path)
+    run.add_argument("--attention-artifact", type=Path)
+    run.add_argument("--variant-label")
+    run.add_argument("--gemm-mode", choices=("bf16", "rtn", "ptq"))
     run.add_argument("--reference-dir", type=Path)
     run.add_argument("--max-prompts", type=int, default=1)
     run.add_argument("--prompt-offset", type=int, default=0)
@@ -993,6 +1458,9 @@ def _parse_args():
     compare.add_argument("--reference-dir", type=Path, required=True)
     compare.add_argument("--arm-dir", type=Path, action="append", required=True)
     compare.add_argument("--output", type=Path, required=True)
+    aggregate = subparsers.add_parser("aggregate")
+    aggregate.add_argument("--report", type=Path, action="append", required=True)
+    aggregate.add_argument("--output", type=Path, required=True)
     aggregate_attention = subparsers.add_parser("aggregate-attention")
     aggregate_attention.add_argument(
         "--report", type=Path, action="append", required=True
@@ -1016,6 +1484,9 @@ if __name__ == "__main__":
                 fixed_latent_path=cli.fixed_latent,
                 output_root=cli.output_root,
                 artifact_path=cli.artifact,
+                attention_artifact_path=cli.attention_artifact,
+                variant_label=cli.variant_label,
+                gemm_mode=cli.gemm_mode,
                 reference_dir=cli.reference_dir,
                 max_prompts=cli.max_prompts,
                 prompt_offset=cli.prompt_offset,
@@ -1026,6 +1497,8 @@ if __name__ == "__main__":
         )
     elif cli.command == "compare":
         print(compare_runs(cli.reference_dir, cli.arm_dir, cli.output)["arms"].keys())
+    elif cli.command == "aggregate":
+        print(aggregate_reports(cli.report, cli.output).get("selection_by_gemm_mode", {}))
     else:
         print(
             aggregate_attention_reports(

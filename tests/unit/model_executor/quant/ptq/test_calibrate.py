@@ -4,6 +4,8 @@ import pytest
 
 from xfuser.model_executor.quant.ptq.calibrate import (
     CalibrationSettings,
+    _parse_args,
+    _settings_payload,
     assert_no_prompt_overlap,
     build_eager_bf16_args,
     preflight_eager_bf16,
@@ -82,3 +84,20 @@ def test_calibration_requires_exact_revision_and_cfg(tmp_path):
             prompts_path=tmp_path / "prompts.txt",
             guidance_scale=1.0,
         )
+
+
+def test_attention_stats_is_opt_in_and_legacy_payload_is_unchanged(
+    tmp_path, monkeypatch
+):
+    prompts_path = tmp_path / "prompts.txt"
+    disabled = CalibrationSettings(prompts_path=prompts_path)
+    assert "attention_stats" not in _settings_payload(disabled)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["calibrate", "--prompts", str(prompts_path), "--attention-stats"],
+    )
+    enabled = _parse_args()
+
+    assert enabled.attention_stats
+    assert _settings_payload(enabled)["attention_stats"] is True

@@ -8,10 +8,12 @@ from xfuser.model_executor.quant.ptq import evaluate
 from xfuser.model_executor.quant.ptq.evaluate import (
     AttentionDecompositionHooks,
     ErrorSums,
+    StepTimer,
     _callback,
     _eval_args,
     _sample_rows,
     _velocity_metrics,
+    aggregate_reports,
     aggregate_attention_reports,
 )
 
@@ -65,6 +67,40 @@ def test_attention_arms_hold_gemms_in_bf16_and_change_only_self_attention():
     assert candidate.attention_backend == "AITER_MXFP4"
     assert reference.cross_attention_backend == "AITER_BF16"
     assert candidate.cross_attention_backend == "AITER_BF16"
+
+
+def test_attention_arm_can_match_each_gemm_mode_and_pass_transform_path():
+    rtn = _eval_args(
+        "attn_mxfp4",
+        None,
+        gemm_mode="rtn",
+        attention_artifact_path="/tmp/attention-transform",
+    )
+    ptq = _eval_args(
+        "attn_mxfp4",
+        "/tmp/gemm-artifact",
+        gemm_mode="ptq",
+        attention_artifact_path="/tmp/attention-transform",
+    )
+
+    assert rtn.gemm_quantization_spec.is_pure("fp4")
+    assert rtn.ptq_artifact_path is None
+    assert ptq.gemm_quantization_spec.is_pure("fp4")
+    assert ptq.ptq_artifact_path == "/tmp/gemm-artifact"
+    assert ptq.ptq_attention_artifact_path == "/tmp/attention-transform"
+
+
+def test_step_timer_excludes_first_callback(monkeypatch):
+    clock = iter((10.0, 10.2, 10.5))
+    monkeypatch.setattr(evaluate.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(evaluate.torch.cuda, "is_available", lambda: False)
+    timer = StepTimer()
+
+    timer.mark()
+    timer.mark()
+    timer.mark()
+
+    assert timer.report()["values_s"] == pytest.approx([0.2, 0.3])
 
 
 def test_velocity_metrics_uses_wan_conditional_then_unconditional_call_order():
@@ -129,6 +165,53 @@ def test_attention_aggregate_applies_small_error_and_p_dominance_gates(tmp_path)
     assert summary["rung3"]["mean_error_ratio_to_rtn_gemm"] == pytest.approx(0.05)
     assert summary["decomposition"]["p_dominates"] is True
     assert summary["gate"]["decision"] == "stop"
+
+
+def test_stage3_aggregate_selects_by_rung3_then_rung4(tmp_path):
+    def candidate(label, rung3, rung4):
+        return {
+            "variant_label": label,
+            "attention_artifact_id": f"artifact-{label}",
+            "gemm_mode": "bf16",
+            "prompts": [
+                {
+                    "index": 0,
+                    "rung3": {
+                        "transformer": rung3,
+                        "transformer_2": rung3,
+                        "equal_mean": rung3,
+                    },
+                    "rung4": {"final_latent": rung4},
+                }
+            ],
+        }
+
+    report = {
+        "arms": {},
+        "candidate_gap_closed": [
+            candidate("t1", 0.2, 0.1),
+            candidate("t2", 0.2, 0.3),
+            candidate("t1+t2", 0.1, 0.9),
+            candidate("t1+t2+t3", 0.0, 0.9),
+            candidate("unregistered", 0.9, 0.9),
+        ],
+    }
+    report_path = tmp_path / "report.json"
+    output_path = tmp_path / "summary.json"
+    report_path.write_text(json.dumps(report))
+
+    summary = aggregate_reports([report_path], output_path)
+
+    selection = summary["selection_by_gemm_mode"]["bf16"]
+    assert selection["status"] == "selected"
+    assert selection["selected_variant"] == "t2"
+    assert selection["power_of_two_followup_variant"] == "t2+t3-pow2"
+    assert (
+        summary["variants_by_gemm_mode"]["bf16"]["t2"]["gap_closed"]["rung3"][
+            "equal_mean"
+        ]["mean"]
+        == pytest.approx(0.2)
+    )
 
 
 def test_attention_decomposition_hooks_select_fixed_blocks_and_calls(monkeypatch):

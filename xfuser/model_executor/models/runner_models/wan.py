@@ -91,6 +91,31 @@ class xFuserWanModel(xFuserModel):
     # Every 14B and A14B Wan transformer; runners for other sizes override it.
     attention_heads = 40
 
+    def _post_load_and_state_initialization(self, input_args: dict) -> None:
+        super()._post_load_and_state_initialization(input_args)
+        path = self.config.ptq_attention_artifact_path
+        if not path:
+            return
+        if not self.config.model_revision:
+            raise ValueError(
+                "ptq_attention_artifact_path requires an exact model revision"
+            )
+        from xfuser.model_executor.quant.ptq.attn_transforms import (
+            apply_attention_artifact,
+            load_attention_artifact,
+        )
+
+        artifact = load_attention_artifact(
+            path, expected_source_revision=self.config.model_revision
+        )
+        components = {
+            name: getattr(self.pipe, name)
+            for name in ("transformer", "transformer_2")
+            if getattr(self.pipe, name, None) is not None
+        }
+        apply_attention_artifact(components, artifact)
+        log(f"Applied attention-transform artifact {artifact.artifact_id}")
+
     def prepare_run(self, input_args: dict) -> None:
         super().prepare_run(input_args)
         get_runtime_state().reset_vsa_schedule_state(int(input_args["num_inference_steps"]))

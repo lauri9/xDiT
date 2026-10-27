@@ -13,6 +13,7 @@ from pathlib import Path
 
 import torch
 
+from .attn_observers import WanAttentionStatsObservers
 from .observers import WanHessianObservers
 
 
@@ -41,6 +42,7 @@ class CalibrationSettings:
     tokens_per_forward: int | None = None
     max_prompts: int | None = None
     block_indices: tuple[int, ...] | None = None
+    attention_stats: bool = False
 
     def __post_init__(self) -> None:
         if len(self.model_revision) != 40 or any(
@@ -87,6 +89,9 @@ def _settings_payload(settings: CalibrationSettings) -> dict:
     payload = dataclasses.asdict(settings)
     payload["prompts_path"] = str(settings.prompts_path)
     payload["output_root"] = str(settings.output_root)
+    # Keep legacy calibration IDs and records unchanged when the opt-in is absent.
+    if not payload["attention_stats"]:
+        del payload["attention_stats"]
     return payload
 
 
@@ -105,6 +110,7 @@ def build_eager_bf16_args(
     *,
     gemm_quantization: str | None = None,
     ptq_artifact_path: str | None = None,
+    ptq_attention_artifact_path: str | None = None,
 ):
     from xfuser import xFuserArgs
 
@@ -135,6 +141,7 @@ def build_eager_bf16_args(
         use_int8_gemms=False,
         gemm_quantization=gemm_quantization,
         ptq_artifact_path=ptq_artifact_path,
+        ptq_attention_artifact_path=ptq_attention_artifact_path,
         use_fp8_text_encoder=False,
         use_fp8_comms=False,
         use_hybrid_attn_schedule=False,
@@ -202,6 +209,48 @@ def _all_reduce_observers(observers: WanHessianObservers) -> None:
         )
         torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
         accumulator.token_count = int(count.item())
+
+
+def _all_reduce_attention_observers(
+    observers: WanAttentionStatsObservers,
+) -> None:
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
+        return
+    for group in observers.groups.values():
+        for accumulator in (group.query, group.key, group.value):
+            torch.distributed.all_reduce(
+                accumulator.sum, op=torch.distributed.ReduceOp.SUM
+            )
+            torch.distributed.all_reduce(
+                accumulator.sum_squares, op=torch.distributed.ReduceOp.SUM
+            )
+            torch.distributed.all_reduce(
+                accumulator.absmax, op=torch.distributed.ReduceOp.MAX
+            )
+            count = torch.tensor(
+                [accumulator.token_count],
+                dtype=torch.int64,
+                device=accumulator.device,
+            )
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            accumulator.token_count = int(count.item())
+
+
+def _save_attention_observers(
+    output_dir: Path,
+    expert_name: str,
+    observers: WanAttentionStatsObservers,
+) -> str:
+    filename = f"{expert_name}_attention_stats.pt"
+    torch.save(
+        {
+            "format_version": 1,
+            "layout": "block_head_channel",
+            "groups": observers.state_dict(),
+        },
+        output_dir / filename,
+    )
+    return filename
 
 
 def _save_observers(
@@ -304,6 +353,19 @@ def run_calibration(settings: CalibrationSettings) -> Path:
     }
     high = WanHessianObservers(model.pipe.transformer, **observer_kwargs)
     low = WanHessianObservers(model.pipe.transformer_2, **observer_kwargs)
+    attention_high = None
+    attention_low = None
+    if settings.attention_stats:
+        attention_observer_kwargs = {
+            "device": observer_kwargs["device"],
+            "block_indices": settings.block_indices,
+        }
+        attention_high = WanAttentionStatsObservers(
+            model.pipe.transformer, **attention_observer_kwargs
+        )
+        attention_low = WanAttentionStatsObservers(
+            model.pipe.transformer_2, **attention_observer_kwargs
+        )
     try:
         local_indices = prompt_indices(len(prompts), rank, world_size)
         prompt_wall_seconds = {}
@@ -330,9 +392,16 @@ def run_calibration(settings: CalibrationSettings) -> Path:
     finally:
         high.remove()
         low.remove()
+        if attention_high is not None:
+            attention_high.remove()
+        if attention_low is not None:
+            attention_low.remove()
 
     _all_reduce_observers(high)
     _all_reduce_observers(low)
+    if attention_high is not None and attention_low is not None:
+        _all_reduce_attention_observers(attention_high)
+        _all_reduce_attention_observers(attention_low)
     if rank == 0:
         _save_observers(output_dir, "transformer", high)
         _save_observers(output_dir, "transformer_2", low)
@@ -340,6 +409,16 @@ def run_calibration(settings: CalibrationSettings) -> Path:
             output_dir,
             {"transformer": high, "transformer_2": low},
         )
+        attention_files = None
+        if attention_high is not None and attention_low is not None:
+            attention_files = {
+                "transformer": _save_attention_observers(
+                    output_dir, "transformer", attention_high
+                ),
+                "transformer_2": _save_attention_observers(
+                    output_dir, "transformer_2", attention_low
+                ),
+            }
         scheduler = model.pipe.scheduler
         record = {
             "calib_id": calib_id,
@@ -377,6 +456,32 @@ def run_calibration(settings: CalibrationSettings) -> Path:
                 "peak_memory_bytes": torch.cuda.max_memory_allocated(),
             },
         }
+        if attention_files is not None:
+            record["attention_stats"] = {
+                "enabled": True,
+                "files": attention_files,
+                "layout": "per_block_head_channel",
+                "tensors": ["post_rope_q", "post_rope_k", "v"],
+                "statistics": [
+                    "sum",
+                    "sum_squares",
+                    "absmax",
+                    "token_count",
+                ],
+                "padding_mask": "valid_kv_len",
+                "dtypes": {
+                    "sum": "fp64",
+                    "sum_squares": "fp64",
+                    "absmax": "fp32",
+                    "token_count": "int64",
+                },
+                "distributed_merge": {
+                    "sum": "SUM",
+                    "sum_squares": "SUM",
+                    "absmax": "MAX",
+                    "token_count": "SUM",
+                },
+            }
         (output_dir / "calib_record.json").write_text(
             json.dumps(record, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -395,6 +500,11 @@ def _parse_args() -> CalibrationSettings:
     parser.add_argument("--token-sample-rate", type=float, default=1.0)
     parser.add_argument("--tokens-per-forward", type=int)
     parser.add_argument(
+        "--attention-stats",
+        action="store_true",
+        help="Collect post-RoPE self-attention Q/K and V channel statistics.",
+    )
+    parser.add_argument(
         "--blocks",
         help="Comma-separated block indices for a technical spike; default observes all blocks.",
     )
@@ -406,6 +516,7 @@ def _parse_args() -> CalibrationSettings:
         max_prompts=args.max_prompts,
         token_sample_rate=args.token_sample_rate,
         tokens_per_forward=args.tokens_per_forward,
+        attention_stats=args.attention_stats,
         block_indices=(
             tuple(int(value) for value in args.blocks.split(","))
             if args.blocks

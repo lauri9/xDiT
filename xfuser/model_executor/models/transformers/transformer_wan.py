@@ -121,7 +121,15 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         else:
             query, key, value = self._qk_norm_rope_reference(attn, query, key, value, rotary_emb)
 
+        if not self.is_cross_attention and attn._xfuser_use_k_shift:
+            # T1 must run while heads are still in canonical order and before
+            # USP performs its Ulysses all-to-all/head balancing.
+            key = key - attn.k_shift.to(dtype=key.dtype)
+
         if self.qkv_observer is not None:
+            # Observe the operands that actually enter attention. Calibration
+            # has no artifact loaded, while candidate diagnostics include all
+            # loaded T1/T2/T3 transforms.
             self.qkv_observer(attn, query, key, value)
 
         # I2V task
@@ -261,6 +269,18 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
                 torch.arange(num_attention_heads, dtype=torch.long),
                 persistent=False,
             )
+            # Stage-2 T1 artifact destination. Register it before compile even
+            # when no artifact is loaded; all-zero is the exact identity.
+            block.attn1.register_buffer(
+                "k_shift",
+                torch.zeros(
+                    num_attention_heads,
+                    attention_head_dim,
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            block.attn1._xfuser_use_k_shift = False
         # attn2 is cross-attention over the text encoder: no Ulysses collective.
         register_fp8_comms_eligible_modules(self, [block.attn1 for block in self.blocks])
         # Pad rows of this rank's chunk, set per forward; 0 leaves the blocks untouched.

@@ -245,6 +245,7 @@ class xFuserArgs:
     use_fp8_text_encoder: bool = False
     use_fp4_gemms: bool = False
     ptq_artifact_path: Optional[str] = None
+    ptq_attention_artifact_path: Optional[str] = None
     # Internal compatibility bridge derived from gemm_quantization.
     use_fp6_gemms: bool = False
     use_a6w4_gemms: bool = False
@@ -742,6 +743,12 @@ class xFuserArgs:
             help="Quantize Ulysses all-to-all communication to FP8.",
         )
         runtime_group.add_argument(
+            "--ptq_attention_artifact_path",
+            type=nullable_str,
+            default=None,
+            help="Load offline-fitted self-attention transforms from this artifact.",
+        )
+        runtime_group.add_argument(
             "--fp8_comms_scale",
             type=float,
             default=None,
@@ -1067,6 +1074,12 @@ class xFuserArgs:
             type=str,
             default=None,
             help="Load pre-quantized MXFP4 transformer weights from this PTQ artifact.",
+        )
+        parser.add_argument(
+            "--ptq_attention_artifact_path",
+            type=nullable_str,
+            default=None,
+            help="Load offline-fitted self-attention transforms from this artifact.",
         )
         parser.add_argument(
             "--fp8_precision_override_prefix_patterns",
