@@ -179,3 +179,71 @@ def mxfp4_attention_ref(
     quantized_v = quantize_mxfp4_v(value) if quantize_v else value.to(torch.float32)
     output = torch.einsum("bhqk,bkhd->bqhd", probability, quantized_v)
     return output.to(query.dtype)
+
+
+def mxfp4_attention_decomposition(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    query_indices: torch.Tensor,
+    softmax_scale: float | None = None,
+) -> dict[str, torch.Tensor]:
+    """Evaluate Q-only, K-only, V-only, P-only and full MXFP4 error arms.
+
+    ``query_indices`` samples query rows while retaining the complete K/V
+    context. This keeps the production softmax distribution without
+    materializing a square production-length score matrix.
+    """
+
+    if query_indices.ndim != 1 or query_indices.numel() == 0:
+        raise ValueError("query_indices must be a non-empty vector")
+    if query_indices.min().item() < 0 or query_indices.max().item() >= query.shape[1]:
+        raise ValueError("query_indices are outside the query sequence")
+
+    scale = HEAD_DIM**-0.5 if softmax_scale is None else softmax_scale
+    sampled_query = query.index_select(1, query_indices.to(query.device))
+    rotated_q = normalized_hadamard_128(sampled_query) * (
+        scale * MHA_V4_LOG2E
+    )
+    rotated_q = rotated_q.to(query.dtype).to(torch.float32)
+    quantized_q = _mxfp4_rows(rotated_q)
+
+    rotated_k = normalized_hadamard_128(key).to(key.dtype).to(torch.float32)
+    quantized_key_input = key
+    mean = aiter_k_mean(key)
+    if mean is not None:
+        quantized_key_input = key.to(torch.float32) - mean.unsqueeze(1)
+    quantized_k = _mxfp4_rows(
+        normalized_hadamard_128(quantized_key_input).to(key.dtype).to(torch.float32)
+    )
+    quantized_v = quantize_mxfp4_v(value)
+
+    def probability(q_values, k_values, *, quantized):
+        logits_log2 = torch.einsum("bqhd,bkhd->bhqk", q_values, k_values)
+        shifted = logits_log2 - logits_log2.amax(dim=-1, keepdim=True)
+        unnormalized = torch.exp2(shifted)
+        denominator = unnormalized.sum(dim=-1, keepdim=True)
+        if quantized:
+            unnormalized = quantize_fp6_e3m2(unnormalized)
+        return unnormalized / denominator
+
+    probability_ref = probability(rotated_q, rotated_k, quantized=False)
+    probability_q = probability(quantized_q, rotated_k, quantized=False)
+    probability_k = probability(rotated_q, quantized_k, quantized=False)
+    probability_p = probability(rotated_q, rotated_k, quantized=True)
+    probability_all = probability(quantized_q, quantized_k, quantized=True)
+
+    def attend(probabilities, values):
+        return torch.einsum(
+            "bhqk,bkhd->bqhd", probabilities, values.to(torch.float32)
+        ).to(query.dtype)
+
+    return {
+        "reference": attend(probability_ref, value),
+        "q_only": attend(probability_q, value),
+        "k_only": attend(probability_k, value),
+        "v_only": attend(probability_ref, quantized_v),
+        "p_only": attend(probability_p, value),
+        "all": attend(probability_all, quantized_v),
+    }

@@ -28,6 +28,7 @@ from .calibrate import (
     read_prompts,
 )
 from .mxfp4_ref import dequantize_mxfp4, quantize_mxfp4
+from .attn_mxfp4_ref import mxfp4_attention_decomposition
 from .provenance import runtime_manifest
 
 
@@ -225,12 +226,102 @@ class TraceHooks:
             handle.remove()
 
 
+class AttentionDecompositionHooks:
+    """Decompose attention error at fixed layers/calls over the full K/V context."""
+
+    _BLOCKS = (0, 20, 39)
+    _CALLS = {
+        "transformer": frozenset((0, 6, 12)),
+        "transformer_2": frozenset((0, 12, 24)),
+    }
+
+    def __init__(self, pipe, query_rows: int = 4):
+        self.query_rows = query_rows
+        self.calls = defaultdict(int)
+        self.rows = []
+        self.processors = []
+        for component in ("transformer", "transformer_2"):
+            transformer = getattr(pipe, component)
+            for block_index in self._BLOCKS:
+                processor = transformer.blocks[block_index].attn1.processor
+                if processor.qkv_observer is not None:
+                    raise RuntimeError("attention processor already has a Q/K/V observer")
+                processor.qkv_observer = self._observer(component, block_index)
+                self.processors.append(processor)
+
+    def _observer(self, component, block_index):
+        def observe(_attention, query, key, value):
+            call = self.calls[(component, block_index)]
+            self.calls[(component, block_index)] += 1
+            if call not in self._CALLS[component]:
+                return
+            indices = torch.linspace(
+                0,
+                query.shape[1] - 1,
+                min(self.query_rows, query.shape[1]),
+                device=query.device,
+            ).round().long()
+            outputs = mxfp4_attention_decomposition(
+                query,
+                key,
+                value,
+                query_indices=indices,
+            )
+            reference = outputs.pop("reference")
+            errors = {}
+            for arm, output in outputs.items():
+                sums = ErrorSums()
+                sums.update(reference, output)
+                errors[arm] = sums.report()
+
+            def stats(tensor):
+                values = tensor.float()
+                return {
+                    "rms": values.square().mean().sqrt().item(),
+                    "absmax": values.abs().amax().item(),
+                }
+
+            self.rows.append(
+                {
+                    "expert": component,
+                    "block": block_index,
+                    "call": call,
+                    "query_indices": indices.detach().cpu().tolist(),
+                    "shape": {
+                        "q": list(query.shape),
+                        "k": list(key.shape),
+                        "v": list(value.shape),
+                    },
+                    "input_stats": {
+                        "q": stats(query),
+                        "k": stats(key),
+                        "v": stats(value),
+                    },
+                    "errors": errors,
+                }
+            )
+
+        return observe
+
+    def remove(self) -> list[dict]:
+        for processor in self.processors:
+            processor.qkv_observer = None
+        return self.rows
+
+
 def _eval_args(arm: str, artifact_path: Path | None):
-    settings = CalibrationSettings(prompts_path=Path("unused"))
+    attention_backend = {
+        "attn_bf16": "AITER_BF16",
+        "attn_mxfp4": "AITER_MXFP4",
+    }.get(arm, "AITER_MXFP4")
+    settings = CalibrationSettings(
+        prompts_path=Path("unused"),
+        attention_backend=attention_backend,
+    )
     args = build_eager_bf16_args(
         settings,
         1,
-        gemm_quantization="fp4" if arm != "bf16" else None,
+        gemm_quantization="fp4" if arm in ("rtn", "ptq") else None,
         ptq_artifact_path=(
             str(artifact_path) if arm == "ptq" and artifact_path else None
         ),
@@ -268,6 +359,7 @@ def run_arm(
     prompt_offset: int,
     force_reference_trajectory: bool,
     layer_metrics: bool,
+    attention_decomposition: bool,
 ) -> Path:
     from xfuser.core.distributed import init_distributed_environment
     from xfuser.model_executor.models.runner_models.base_model import MODEL_REGISTRY
@@ -286,6 +378,10 @@ def run_arm(
     if len(prompts) < max_prompts:
         raise ValueError("not enough held-out prompts after excluding calibration prompts")
     assert_no_prompt_overlap(calibration_prompts, prompts)
+    if attention_decomposition and (arm != "attn_bf16" or len(prompts) != 1):
+        raise ValueError(
+            "attention decomposition requires one attn_bf16 reference prompt"
+        )
     args = _eval_args(arm, artifact_path)
     model = MODEL_REGISTRY[MODEL_ID](args)
     input_args = {
@@ -315,6 +411,7 @@ def run_arm(
         "prompt_count": len(prompts),
         "fixed_latent_sha256": hashlib.sha256(fixed_latent_path.read_bytes()).hexdigest(),
         "force_reference_trajectory": force_reference_trajectory,
+        "attention_backend": args.attention_backend,
         "prompts": [],
     }
     if artifact_path:
@@ -330,6 +427,11 @@ def run_arm(
     layer_hook = (
         LayerErrorHooks(model.pipe, artifact_path)
         if layer_metrics and arm == "bf16" and artifact_path
+        else None
+    )
+    attention_hook = (
+        AttentionDecompositionHooks(model.pipe)
+        if attention_decomposition
         else None
     )
     try:
@@ -392,6 +494,12 @@ def run_arm(
         if layer_hook is not None:
             reports = layer_hook.remove()
             (output_dir / "rung1-layer-error.json").write_text(
+                json.dumps(reports, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        if attention_hook is not None:
+            reports = attention_hook.remove()
+            (output_dir / "attention-decomposition.json").write_text(
                 json.dumps(reports, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
@@ -745,11 +853,131 @@ def aggregate_reports(report_paths: list[Path], output: Path) -> dict:
     return summary
 
 
+def aggregate_attention_reports(
+    report_paths: list[Path],
+    rtn_report_paths: list[Path],
+    decomposition_path: Path,
+    output: Path,
+) -> dict:
+    """Aggregate Stage 0B attention errors and apply its pre-registered gate."""
+
+    if len(report_paths) != len(rtn_report_paths):
+        raise ValueError("attention and RTN report counts must match")
+    reports = [
+        json.loads(path.read_text(encoding="utf-8")) for path in report_paths
+    ]
+    rtn_reports = [
+        json.loads(path.read_text(encoding="utf-8")) for path in rtn_report_paths
+    ]
+    candidate_rung3 = defaultdict(list)
+    rtn_rung3 = defaultdict(list)
+    rung4 = []
+    frame_ssim = []
+    frame_psnr = []
+    for report, rtn_report in zip(reports, rtn_reports):
+        prompt = report["arms"]["attn_mxfp4"]["prompts"][0]
+        rtn_prompt = rtn_report["arms"]["rtn"]["prompts"][0]
+        for expert in ("transformer", "transformer_2"):
+            candidate_rung3[expert].append(
+                prompt["rung3"]["velocity"][expert]["cfg_combined"]["relative_mse"]
+            )
+            rtn_rung3[expert].append(
+                rtn_prompt["rung3"]["velocity"][expert]["cfg_combined"]["relative_mse"]
+            )
+        rung4.append(prompt["rung4"]["latent_drift"][-1]["relative_mse"])
+        frame_ssim.append(prompt["rung4"]["frame_ssim"])
+        frame_psnr.append(statistics.fmean(prompt["rung4"]["frame_psnr_db"]))
+
+    candidate_values = [
+        value for expert in candidate_rung3.values() for value in expert
+    ]
+    rtn_values = [value for expert in rtn_rung3.values() for value in expert]
+    rung3_ratio = statistics.fmean(candidate_values) / max(
+        statistics.fmean(rtn_values), 1.0e-30
+    )
+
+    decomposition_rows = json.loads(
+        decomposition_path.read_text(encoding="utf-8")
+    )
+    isolated = defaultdict(list)
+    for row in decomposition_rows:
+        for arm, metrics in row["errors"].items():
+            isolated[arm].append(metrics["relative_mse"])
+    isolated_means = {
+        arm: statistics.fmean(values) for arm, values in sorted(isolated.items())
+    }
+    isolated_sum = sum(isolated_means[arm] for arm in ("q_only", "k_only", "v_only", "p_only"))
+    p_fraction = isolated_means["p_only"] / max(isolated_sum, 1.0e-30)
+    p_dominates = isolated_means["p_only"] >= max(
+        isolated_means[arm] for arm in ("q_only", "k_only", "v_only")
+    ) and p_fraction >= 0.5
+    error_too_small = rung3_ratio < 0.1
+
+    summary = {
+        "reports": [str(path) for path in report_paths],
+        "rtn_reports": [str(path) for path in rtn_report_paths],
+        "prompt_count": len(reports),
+        "rung3": {
+            "attention_relative_mse": {
+                expert: {
+                    "mean": statistics.fmean(values),
+                    "values": values,
+                }
+                for expert, values in candidate_rung3.items()
+            },
+            "rtn_gemm_relative_mse": {
+                expert: {
+                    "mean": statistics.fmean(values),
+                    "values": values,
+                }
+                for expert, values in rtn_rung3.items()
+            },
+            "mean_error_ratio_to_rtn_gemm": rung3_ratio,
+        },
+        "rung4": {
+            "final_latent_relative_mse": {
+                "mean": statistics.fmean(rung4),
+                "values": rung4,
+            },
+            "frame_ssim": {
+                "mean": statistics.fmean(frame_ssim),
+                "values": frame_ssim,
+            },
+            "frame_psnr_db": {
+                "mean": statistics.fmean(frame_psnr),
+                "values": frame_psnr,
+            },
+        },
+        "decomposition": {
+            "path": str(decomposition_path),
+            "measurements": len(decomposition_rows),
+            "mean_relative_mse": isolated_means,
+            "p_fraction_of_isolated_error_sum": p_fraction,
+            "p_dominates": p_dominates,
+        },
+        "gate": {
+            "error_under_ten_percent_of_rtn": error_too_small,
+            "p_quantization_dominates": p_dominates,
+            "decision": "stop" if error_too_small or p_dominates else "advance",
+        },
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return summary
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run")
-    run.add_argument("--arm", choices=("bf16", "rtn", "ptq"), required=True)
+    run.add_argument(
+        "--arm",
+        choices=("bf16", "rtn", "ptq", "attn_bf16", "attn_mxfp4"),
+        required=True,
+    )
     run.add_argument("--prompts", type=Path, required=True)
     run.add_argument("--calibration-prompts", type=Path, required=True)
     run.add_argument("--fixed-latent", type=Path, required=True)
@@ -760,10 +988,20 @@ def _parse_args():
     run.add_argument("--prompt-offset", type=int, default=0)
     run.add_argument("--force-reference-trajectory", action="store_true")
     run.add_argument("--layer-metrics", action="store_true")
+    run.add_argument("--attention-decomposition", action="store_true")
     compare = subparsers.add_parser("compare")
     compare.add_argument("--reference-dir", type=Path, required=True)
     compare.add_argument("--arm-dir", type=Path, action="append", required=True)
     compare.add_argument("--output", type=Path, required=True)
+    aggregate_attention = subparsers.add_parser("aggregate-attention")
+    aggregate_attention.add_argument(
+        "--report", type=Path, action="append", required=True
+    )
+    aggregate_attention.add_argument(
+        "--rtn-report", type=Path, action="append", required=True
+    )
+    aggregate_attention.add_argument("--decomposition", type=Path, required=True)
+    aggregate_attention.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
 
@@ -783,7 +1021,17 @@ if __name__ == "__main__":
                 prompt_offset=cli.prompt_offset,
                 force_reference_trajectory=cli.force_reference_trajectory,
                 layer_metrics=cli.layer_metrics,
+                attention_decomposition=cli.attention_decomposition,
             )
         )
-    else:
+    elif cli.command == "compare":
         print(compare_runs(cli.reference_dir, cli.arm_dir, cli.output)["arms"].keys())
+    else:
+        print(
+            aggregate_attention_reports(
+                cli.report,
+                cli.rtn_report,
+                cli.decomposition,
+                cli.output,
+            )["gate"]
+        )

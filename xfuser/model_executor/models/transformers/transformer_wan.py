@@ -1,5 +1,5 @@
 import torch
-from typing import Optional, Union, Dict, Any, Tuple
+from typing import Optional, Union, Dict, Any, Tuple, Callable
 
 from diffusers.models.transformers.transformer_wan import WanAttnProcessor
 from diffusers.models.transformers.transformer_wan import WanAttention
@@ -44,6 +44,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         else:
             self.attention_function = attention
         self.is_cross_attention = is_cross_attention
+        self.qkv_observer: Optional[
+            Callable[["WanAttention", torch.Tensor, torch.Tensor, torch.Tensor], None]
+        ] = None
         # attention_kwargs is the shared, mutable dict used by sparse backends
         # (SSTA / sparge) to receive layout info like `thw`. Cross-attention and
         # the I2V image-context sub-call below are dense, so they don't read it.
@@ -117,6 +120,9 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             value = value.unflatten(2, (attn.heads, -1))
         else:
             query, key, value = self._qk_norm_rope_reference(attn, query, key, value, rotary_emb)
+
+        if self.qkv_observer is not None:
+            self.qkv_observer(attn, query, key, value)
 
         # I2V task
         hidden_states_img = None

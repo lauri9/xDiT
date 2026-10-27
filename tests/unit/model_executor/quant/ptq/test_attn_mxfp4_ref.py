@@ -6,6 +6,7 @@ torch = pytest.importorskip("torch")
 
 from xfuser.model_executor.quant.ptq.attn_mxfp4_ref import (
     aiter_k_mean,
+    mxfp4_attention_decomposition,
     mxfp4_attention_ref,
     normalized_hadamard_128,
     quantize_fp6_e3m2,
@@ -95,3 +96,36 @@ def test_invalid_attention_shapes_are_rejected():
 
     with pytest.raises(ValueError, match="head dimension 128"):
         mxfp4_attention_ref(query, query, query)
+
+
+def test_decomposition_samples_queries_against_the_full_kv_context():
+    torch.manual_seed(4)
+    query = torch.randn((1, 9, 2, 128), dtype=torch.bfloat16)
+    key = torch.randn((1, 11, 2, 128), dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    indices = torch.tensor([0, 4, 8])
+
+    outputs = mxfp4_attention_decomposition(
+        query,
+        key,
+        value,
+        query_indices=indices,
+    )
+
+    assert set(outputs) == {
+        "reference",
+        "q_only",
+        "k_only",
+        "v_only",
+        "p_only",
+        "all",
+    }
+    assert all(output.shape == (1, 3, 2, 128) for output in outputs.values())
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        query.index_select(1, indices).transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+    ).transpose(1, 2)
+    torch.testing.assert_close(
+        outputs["reference"], expected, rtol=2.0e-2, atol=2.0e-2
+    )
