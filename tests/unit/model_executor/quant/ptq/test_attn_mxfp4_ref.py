@@ -76,6 +76,28 @@ def test_p_conversion_scales_each_key_block_and_rounds_to_even():
     assert torch.isfinite(quantize_mxfp6_e2m3(torch.zeros((1, 32)))).all()
 
 
+def test_v_midpoints_round_toward_zero_in_both_signs():
+    values = torch.zeros((1, 64, 1, 128), dtype=torch.bfloat16)
+    rows = torch.tensor([0, 1, 2, 3, 8, 9, 10, 11])
+    values[0, rows, 0, 0] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0])
+    values[..., 1] = -values[..., 0]
+
+    actual = quantize_mxfp4_v(values)
+
+    expected = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    torch.testing.assert_close(actual[0, rows, 0, 0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual[0, rows, 0, 1], -expected, rtol=0, atol=0)
+
+
+def test_unmodeled_probability_overflow_rollback_is_rejected():
+    query = torch.ones((1, 1, 1, 128), dtype=torch.bfloat16)
+    key = torch.zeros((1, 256, 1, 128), dtype=torch.bfloat16)
+    key[:, 200] = 8
+
+    with pytest.raises(NotImplementedError, match="overflow rollback"):
+        mxfp4_attention_ref(query, key, torch.zeros_like(key))
+
+
 @pytest.mark.parametrize("sequence", [33, 4096])
 def test_attention_and_decomposition_preserve_constant_values(sequence):
     generator = torch.Generator().manual_seed(20261029 + sequence)
