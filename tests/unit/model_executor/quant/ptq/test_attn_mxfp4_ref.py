@@ -10,6 +10,7 @@ from xfuser.model_executor.quant.ptq.attn_mxfp4_ref import (
     mxfp4_attention_ref,
     normalized_hadamard_128,
     quantize_fp6_e3m2,
+    quantize_mxfp6_e2m3,
     quantize_mxfp4_v,
 )
 
@@ -51,6 +52,45 @@ def test_v_quantization_blocks_the_sequence_axis_per_channel():
     torch.testing.assert_close(actual[:, :32, :, 0], torch.full((1, 32, 1), 0.5))
     torch.testing.assert_close(actual[:, 32:, :, 0], torch.full((1, 1, 1), 12.0))
     torch.testing.assert_close(actual[:, :, :, 1], torch.full((1, 33, 1), 3.0))
+
+
+def test_p_conversion_scales_each_key_block_and_rounds_to_even():
+    values = torch.zeros((2, 65))
+    values[0, 0] = 1.0
+    values[0, 1:5] = torch.tensor([0.015625, 0.046875, 0.265625, 0.296875])
+    values[0, 32:64] = 2.0**-10
+    values[0, 64] = 2.0**-20
+    values[1] = values[0] * 8
+
+    actual = quantize_mxfp6_e2m3(values)
+
+    torch.testing.assert_close(
+        actual[0, :5], torch.tensor([1.0, 0.0, 0.0625, 0.25, 0.3125]),
+        rtol=0, atol=0,
+    )
+    torch.testing.assert_close(actual[0, 32:], values[0, 32:], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], actual[0] * 8, rtol=0, atol=0)
+    assert torch.isfinite(quantize_mxfp6_e2m3(torch.zeros((1, 32)))).all()
+
+
+@pytest.mark.parametrize("sequence", [33, 4096])
+def test_attention_and_decomposition_preserve_constant_values(sequence):
+    generator = torch.Generator().manual_seed(20261029 + sequence)
+    query = torch.randn((1, 3, 2, 128), generator=generator).mul(2**0.5).bfloat16()
+    key = torch.randn((1, sequence, 2, 128), generator=generator).mul(2**0.5).bfloat16()
+    channels = torch.linspace(-1, 1, 128).bfloat16()
+    value = channels.expand_as(key).clone()
+    indices = torch.tensor([0, 2])
+
+    actual = mxfp4_attention_ref(query, key, value, quantize_v=False)
+    outputs = mxfp4_attention_decomposition(query, key, value, query_indices=indices)
+
+    torch.testing.assert_close(actual, channels.expand_as(query), rtol=0, atol=0)
+    torch.testing.assert_close(
+        outputs["p_only"], channels.expand_as(outputs["p_only"]), rtol=0, atol=0,
+    )
+    expected_all = mxfp4_attention_ref(query.index_select(1, indices), key, value)
+    torch.testing.assert_close(outputs["all"], expected_all, rtol=0, atol=0)
 
 
 def test_aiter_k_centering_gate_rejects_normal_inputs_and_accepts_common_mode():

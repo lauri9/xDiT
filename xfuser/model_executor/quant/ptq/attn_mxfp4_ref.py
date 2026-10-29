@@ -1,7 +1,9 @@
 """Torch reference for the pinned AITER MHA v4 MXFP4 attention recipe.
 
-The reference models numerical values, not AITER's packed tile layouts. Inputs
-and outputs use BSHD, matching ``aiter.ops.mha_v4.mha_v4``.
+The reference models numerical values, not AITER's packed tile layouts. It uses
+standard exp2 rather than the object's packed exponential/online rollback
+arithmetic, so it is not a bit-exact kernel emulator. Inputs and outputs use
+BSHD, matching ``aiter.ops.mha_v4.mha_v4``.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ def normalized_hadamard_128(values: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_fp6_e3m2(values: torch.Tensor) -> torch.Tensor:
-    """Round to finite FP6 E3M2, the MHA v4 probability operand format."""
+    """Round to finite FP6 E3M2 (historical probe, not pinned MHA v4 P)."""
 
     positive = torch.tensor(
         [
@@ -79,6 +81,10 @@ def quantize_fp6_e3m2(values: torch.Tensor) -> torch.Tensor:
         dtype=torch.float32,
         device=values.device,
     )
+    return _round_fp6(values, positive)
+
+
+def _round_fp6(values: torch.Tensor, positive: torch.Tensor) -> torch.Tensor:
     magnitude = values.to(torch.float32).abs()
     boundaries = (positive[:-1] + positive[1:]) * 0.5
     code = torch.bucketize(magnitude, boundaries, right=False)
@@ -88,6 +94,46 @@ def quantize_fp6_e3m2(values: torch.Tensor) -> torch.Tensor:
     code = code + (at_midpoint & ((lower & 1) == 1)).to(code.dtype)
     rounded = positive[code.clamp(max=positive.numel() - 1)]
     return torch.copysign(rounded, values.to(torch.float32))
+
+
+def quantize_mxfp6_e2m3(values: torch.Tensor) -> torch.Tensor:
+    """Convert P with one E8M0 scale per 32 keys along the last dimension.
+
+    The pinned gfx950 object converts BF16 to E2M3, with scale exponent
+    ``max(floor(log2(amax)) - 2, -126)``. Ragged groups are zero padded,
+    without including the padding in the returned probability matrix.
+    """
+
+    sequence = values.shape[-1]
+    padded_sequence = math.ceil(sequence / MX_BLOCK_SIZE) * MX_BLOCK_SIZE
+    bf16_values = values.to(torch.bfloat16).to(torch.float32)
+    if padded_sequence != sequence:
+        bf16_values = torch.nn.functional.pad(
+            bf16_values, (0, padded_sequence - sequence)
+        )
+    grouped = bf16_values.reshape(*values.shape[:-1], -1, MX_BLOCK_SIZE)
+    amax = grouped.abs().amax(dim=-1, keepdim=True)
+    # Extract the BF16 exponent as the object does; this also handles zero
+    # groups without log2(0) and preserves exact powers of two.
+    exponent = ((amax.contiguous().view(torch.int32) >> 23) & 0xFF) - 2
+    scale = (exponent.clamp(min=1) << 23).contiguous().view(torch.float32)
+    positive = torch.tensor(
+        [m / 8 for m in range(8)]
+        + [2 ** (e - 1) * (1 + m / 8) for e in range(1, 4) for m in range(8)],
+        dtype=torch.float32,
+        device=values.device,
+    )
+    converted = _round_fp6(grouped / scale, positive) * scale
+    return converted.reshape(*values.shape[:-1], padded_sequence)[..., :sequence]
+
+
+def _attention_probability(logits_log2: torch.Tensor, *, quantized: bool):
+    shifted = logits_log2 - logits_log2.amax(dim=-1, keepdim=True)
+    unnormalized = torch.exp2(shifted)
+    if quantized:
+        unnormalized = quantize_mxfp6_e2m3(unnormalized)
+    # The denominator uses the same converted P as the PV numerator.
+    return unnormalized / unnormalized.sum(dim=-1, keepdim=True)
 
 
 def _mxfp4_rows(values: torch.Tensor) -> torch.Tensor:
@@ -170,12 +216,7 @@ def mxfp4_attention_ref(
         rotated_k = _mxfp4_rows(rotated_k)
 
     logits_log2 = torch.einsum("bqhd,bkhd->bhqk", rotated_q, rotated_k)
-    shifted = logits_log2 - logits_log2.amax(dim=-1, keepdim=True)
-    unnormalized_probability = torch.exp2(shifted)
-    denominator = unnormalized_probability.sum(dim=-1, keepdim=True)
-    if quantize_p:
-        unnormalized_probability = quantize_fp6_e3m2(unnormalized_probability)
-    probability = unnormalized_probability / denominator
+    probability = _attention_probability(logits_log2, quantized=quantize_p)
     quantized_v = quantize_mxfp4_v(value) if quantize_v else value.to(torch.float32)
     output = torch.einsum("bhqk,bkhd->bqhd", probability, quantized_v)
     return output.to(query.dtype)
@@ -221,12 +262,7 @@ def mxfp4_attention_decomposition(
 
     def probability(q_values, k_values, *, quantized):
         logits_log2 = torch.einsum("bqhd,bkhd->bhqk", q_values, k_values)
-        shifted = logits_log2 - logits_log2.amax(dim=-1, keepdim=True)
-        unnormalized = torch.exp2(shifted)
-        denominator = unnormalized.sum(dim=-1, keepdim=True)
-        if quantized:
-            unnormalized = quantize_fp6_e3m2(unnormalized)
-        return unnormalized / denominator
+        return _attention_probability(logits_log2, quantized=quantized)
 
     probability_ref = probability(rotated_q, rotated_k, quantized=False)
     probability_q = probability(quantized_q, rotated_k, quantized=False)

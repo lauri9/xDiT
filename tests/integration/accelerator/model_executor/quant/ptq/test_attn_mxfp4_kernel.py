@@ -20,23 +20,34 @@ def _mha_v4_mxfp4(query, key, value):
     )
 
 
-@pytest.mark.parametrize("sequence", [128, 208])
+@pytest.mark.parametrize("sequence", [128, 208, 4096, 16384, 75600])
 def test_torch_emulator_matches_mha_v4_mxfp4(sequence):
     generator = torch.Generator(device="cuda").manual_seed(20261027 + sequence)
     shape = (1, sequence, 2, 128)
     query = torch.randn(
-        shape, dtype=torch.bfloat16, device="cuda", generator=generator
-    )
+        shape, dtype=torch.float32, device="cuda", generator=generator
+    ).mul_(2**0.5).bfloat16()
     key = torch.randn(
-        shape, dtype=torch.bfloat16, device="cuda", generator=generator
-    )
+        shape, dtype=torch.float32, device="cuda", generator=generator
+    ).mul_(2**0.5).bfloat16()
     value = torch.randn(
         shape, dtype=torch.bfloat16, device="cuda", generator=generator
     )
 
     with torch.no_grad():
-        expected = _mha_v4_mxfp4(query, key, value)
-        actual = mxfp4_attention_ref(query, key, value)
+        # Full dense kernel, sampled queries with complete K/V in the reference.
+        rows = torch.linspace(0, sequence - 1, min(sequence, 64), device="cuda").long()
+        expected = _mha_v4_mxfp4(query, key, value).index_select(1, rows)
+        sampled_query = query.index_select(1, rows)
+        actual = mxfp4_attention_ref(sampled_query, key, value)
+        ones = torch.ones_like(value)
+        constant_kernel = _mha_v4_mxfp4(query, key, ones).index_select(1, rows)
+        constant_emulator = mxfp4_attention_ref(sampled_query, key, ones)
+
+    torch.testing.assert_close(constant_kernel, torch.ones_like(expected), rtol=0, atol=0)
+    torch.testing.assert_close(constant_emulator, torch.ones_like(actual), rtol=0, atol=0)
+    assert torch.isfinite(expected).all()
+    assert torch.isfinite(actual).all()
 
     expected_f32 = expected.float()
     actual_f32 = actual.float()
@@ -48,8 +59,9 @@ def test_torch_emulator_matches_mha_v4_mxfp4(sequence):
         actual_f32.flatten(), expected_f32.flatten(), dim=0
     ).item()
 
-    assert cosine >= 0.98
-    assert relative_rmse <= 0.25
+    # exp2/online-state approximation: bound residual, not bit-exact agreement.
+    assert cosine >= 0.998, f"S={sequence}: cosine={cosine}, relative_rmse={relative_rmse}"
+    assert relative_rmse <= 0.065, f"S={sequence}: cosine={cosine}, relative_rmse={relative_rmse}"
 
 
 def test_mxfp4_v_tail_matches_sdpa_at_production_remainder():
