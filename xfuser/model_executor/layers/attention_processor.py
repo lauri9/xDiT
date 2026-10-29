@@ -32,10 +32,8 @@ from xfuser.core.distributed import (
     get_ulysses_parallel_world_size,
     get_pipeline_parallel_world_size,
 )
-from xfuser.core.fast_attention import (
-    xFuserFastAttention,
-    get_fast_attn_enable,
-)
+from xfuser.core.fast_attention.attn_layer import xFuserFastAttention
+from xfuser.core.fast_attention.fast_attn_state import get_fast_attn_enable
 
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.runtime_state import get_runtime_state

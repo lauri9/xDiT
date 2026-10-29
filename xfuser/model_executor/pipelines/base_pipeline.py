@@ -40,11 +40,11 @@ from xfuser.envs import (
     get_device,
     get_device_name,
 )
-from xfuser.core.fast_attention import (
+from xfuser.core.fast_attention.fast_attn_state import (
     get_fast_attn_enable,
     initialize_fast_attn_state,
-    fast_attention_compression,
 )
+from xfuser.core.fast_attention.utils import fast_attention_compression
 from xfuser.model_executor.base_wrapper import xFuserBaseWrapper
 from xfuser.model_executor.pipefusion import pipefusion_should_update_progress
 

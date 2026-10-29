@@ -1,13 +1,13 @@
-from typing import Optional
-from diffusers import DiffusionPipeline
-from xfuser.config.config import (
-    ParallelConfig,
-    RuntimeConfig,
-    InputConfig,
-    FastAttnConfig,
-    EngineConfig,
-)
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from xfuser.config.config import FastAttnConfig
 from xfuser.logger import init_logger
+
+if TYPE_CHECKING:
+    # Annotations only. Callers that ask whether fast attention is on must not import diffusers.
+    from diffusers import DiffusionPipeline
 
 logger = init_logger(__name__)
 

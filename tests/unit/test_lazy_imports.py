@@ -130,6 +130,42 @@ def test_runner_help_does_not_import_models():
     )
 
 
+def test_importing_a_layer_wrapper_does_not_import_fast_attn_compression():
+    _run(
+        """
+        import sys
+        from xfuser.model_executor.base_wrapper import xFuserBaseWrapper
+        from xfuser.core.fast_attention.fast_attn_state import get_fast_attn_enable
+        assert xFuserBaseWrapper is not None
+        assert get_fast_attn_enable() is False
+        leaked = [
+            name
+            for name in (
+                "diffusers",
+                "xfuser.core.fast_attention.utils",
+                "xfuser.core.fast_attention.attn_layer",
+                "xfuser.model_executor.layers",
+                "xfuser.model_executor.layers.attention_processor",
+            )
+            if name in sys.modules
+        ]
+        assert not leaked, leaked
+        from xfuser.model_executor.layers import usp
+        assert usp is not None
+        """
+    )
+
+
+def test_fast_attn_package_still_exports_compression_on_access():
+    _run(
+        """
+        from xfuser.core.fast_attention import fast_attention_compression, xFuserFastAttention
+        assert fast_attention_compression is not None
+        assert xFuserFastAttention is not None
+        """
+    )
+
+
 def test_importing_a_pipeline_still_loads_diffusers_and_swaps_group_norm_on_rocm():
     _run(
         """
