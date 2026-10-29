@@ -6,7 +6,7 @@ from xfuser.model_executor.quant.ptq.gemm_transforms import (
     fold_value_output, mix_cfg_hessian,
 )
 from xfuser.model_executor.quant.ptq.mxfp4_ref import (
-    dequantize_mxfp4, quantize_mxfp4, quantize_mxfp4_scale_search,
+    dequantize_mxfp4, quantize_mxfp4, quantize_mxfp4_scale_search, quantize_mxfp4_nearest,
 )
 from xfuser.model_executor.quant.ptq.gptq_mxfp4 import GPTQConfig, gptq_quantize_mxfp4
 
@@ -77,3 +77,14 @@ def test_scale_search_inside_gptq_matches_rtn_search_for_identity_hessian():
     result = gptq_quantize_mxfp4(values,torch.eye(64),GPTQConfig(scale_search=True))
     torch.testing.assert_close(result.packed,p,rtol=0,atol=0)
     torch.testing.assert_close(result.scale,s,rtol=0,atol=0)
+
+
+def test_nearest_scale_intentionally_saturates_outlier_instead_of_ceil_grid():
+    values = torch.ones(1,32)
+    values[0,0] = 3.1
+    full_p,full_s = quantize_mxfp4(values)
+    near_p,near_s = quantize_mxfp4_nearest(values)
+    assert int(full_s[0,0]) == 127
+    assert int(near_s[0,0]) == 126
+    assert float(dequantize_mxfp4(near_p,near_s)[0,0]) == 3.0
+    assert float(dequantize_mxfp4(full_p,full_s)[0,0]) == 3.0

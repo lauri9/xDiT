@@ -149,3 +149,15 @@ def quantize_mxfp4_scale_search(
     use_half = half_loss < full_loss
     packed = torch.where(use_half.unsqueeze(-1), half_packed.reshape(rows, columns // 32, 16), packed.reshape(rows, columns // 32, 16)).reshape(rows, columns // 2)
     return packed, torch.where(use_half, half_scales, scales)
+
+
+def quantize_mxfp4_nearest(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Emulation-only nearest-power-of-two scale with E2M1 saturation."""
+    if values.ndim != 2 or values.shape[-1] % 32:
+        raise ValueError("nearest MXFP4 expects [N,K] with K divisible by 32")
+    rows, columns = values.shape
+    grouped = values.float().reshape(rows, columns // 32, 32)
+    exponent = torch.round(torch.log2(grouped.abs().amax(-1).clamp_min(_MIN_AMAX)/6))
+    scales = (exponent+127).clamp(0,254).to(torch.uint8)
+    codes = _quantize_e2m1_unpacked(grouped/decode_e8m0(scales).unsqueeze(-1))
+    return pack_fp4(codes.reshape(rows, columns)), scales

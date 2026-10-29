@@ -120,6 +120,8 @@ def quantize_calibration(
         "blocks": list(blocks),
         "groups": sorted(groups) if groups is not None else "all",
     }
+    if config.scale_search:
+        gptq_payload["scale_search"] = True
     digest = config_hash(gptq_payload)[:12]
     artifact_id = (
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{digest}"
@@ -148,6 +150,7 @@ def _parse_args():
     parser.add_argument("--groups")
     parser.add_argument("--percdamp", type=float, default=0.01)
     parser.add_argument("--max-cholesky-retries", type=int, default=3)
+    parser.add_argument("--scale-search", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -168,6 +171,7 @@ if __name__ == "__main__":
             config=GPTQConfig(
                 percdamp=cli.percdamp,
                 max_cholesky_retries=cli.max_cholesky_retries,
+                scale_search=cli.scale_search,
             ),
         )
     )
