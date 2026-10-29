@@ -83,10 +83,10 @@ def test_prequantized_fp8_attention_reads_pad_dropped_views_as_copies(batch):
     with their descales; USP then slices the pad off those."""
     spec = registry.get(AttentionBackendType.AITER_FP8)
     _available(spec)
-    from xfuser.core.distributed.fp8_comms import _FP8_DTYPE, _per_tensor_quant
+    from xfuser.core.distributed.fp8_comms import _fp8_dtype, _per_tensor_quant
 
     generator = torch.Generator().manual_seed(0)
-    fp8_max = torch.finfo(_FP8_DTYPE).max
+    fp8_max = torch.finfo(_fp8_dtype()).max
     quantized = []
     for _ in range(3):
         tensor = _randn(batch, HEADS, SEQ_LEN, HEAD_DIM, generator=generator)
