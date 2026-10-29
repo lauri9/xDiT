@@ -1,3 +1,14 @@
+# ruff: noqa: E402
+import sys
+
+# Help must run before the model imports below. `python -m xfuser.runner --help`
+# executes this module; those imports register every runner and load diffusers.
+if __name__ == "__main__" and any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+    from xfuser.cli import print_help
+
+    print_help(prog="xfuser.runner")
+    raise SystemExit(0)
+
 import torch
 import torch.distributed as dist
 import os
@@ -20,7 +31,6 @@ if not os.environ.get("RANK"):
     os.environ["MASTER_PORT"] = "12355"
 
 
-# ruff: noqa: E402
 from xfuser.model_executor.models.runner_models.base_model import MODEL_REGISTRY, xFuserModel, DiffusionOutput
 from xfuser.config import FlexibleArgumentParser
 from xfuser.core.distributed import (

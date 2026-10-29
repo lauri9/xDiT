@@ -68,6 +68,68 @@ def test_importing_args_does_not_import_diffusers_or_aiter():
     )
 
 
+def test_xdit_help_does_not_import_models():
+    _run(
+        """
+        import io
+        import sys
+        from xfuser.cli import main
+        stdout = io.StringIO()
+        sys.stdout = stdout
+        main(["--help"])
+        text = stdout.getvalue()
+        assert text.startswith("usage: xdit"), text
+        assert "--model" in text
+        assert "--nproc_per_node" in text
+        leaked = [
+            name
+            for name in (
+                "diffusers",
+                "aiter",
+                "yunchang",
+                "xfuser.runner",
+                "xfuser.model_executor.pipelines",
+                "xfuser.model_executor.models.runner_models.base_model",
+            )
+            if name in sys.modules
+        ]
+        assert not leaked, leaked
+        """
+    )
+
+
+def test_runner_help_does_not_import_models():
+    _run(
+        """
+        import io
+        import sys
+        sys.argv = ["xfuser.runner", "--help"]
+        stdout = io.StringIO()
+        sys.stdout = stdout
+        import runpy
+        try:
+            runpy.run_module("xfuser.runner", run_name="__main__")
+        except SystemExit as exc:
+            assert exc.code in (None, 0)
+        text = stdout.getvalue()
+        assert text.startswith("usage: xfuser.runner"), text
+        assert "--model" in text
+        leaked = [
+            name
+            for name in (
+                "diffusers",
+                "aiter",
+                "yunchang",
+                "xfuser.model_executor.pipelines",
+                "xfuser.model_executor.models.runner_models.base_model",
+            )
+            if name in sys.modules
+        ]
+        assert not leaked, leaked
+        """
+    )
+
+
 def test_importing_a_pipeline_still_loads_diffusers_and_swaps_group_norm_on_rocm():
     _run(
         """

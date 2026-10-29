@@ -106,6 +106,50 @@ def extract_torchrun_args(args: List[str]) -> Tuple[dict, List[str]]:
     return torchrun_values, runner_args
 
 
+def _help_requested(args: List[str]) -> bool:
+    return any(arg in ("-h", "--help") for arg in args)
+
+
+def print_help(*, prog: str = "xdit", include_launch_args: bool = False) -> None:
+    """Print CLI help from the argument definitions, without loading a model.
+
+    The runner module imports every registered model. Help only needs the parser.
+    """
+    from xfuser.config import FlexibleArgumentParser
+    from xfuser.config.args import xFuserArgs
+
+    parser = FlexibleArgumentParser(prog=prog, description="xFuser Arguments")
+    if include_launch_args:
+        launch = parser.add_argument_group("launcher")
+        launch.add_argument(
+            "--nnodes",
+            default=TORCHRUN_ARGS["--nnodes"],
+            help="Number of nodes. Default: %(default)s.",
+        )
+        launch.add_argument(
+            "--node_rank",
+            default=TORCHRUN_ARGS["--node_rank"],
+            help="Rank of this node. Default: %(default)s.",
+        )
+        launch.add_argument(
+            "--master_addr",
+            default=TORCHRUN_ARGS["--master_addr"],
+            help="Address of the rank-0 node. Default: %(default)s.",
+        )
+        launch.add_argument(
+            "--master_port",
+            default=TORCHRUN_ARGS["--master_port"],
+            help="Port on the rank-0 node. Default: %(default)s.",
+        )
+        launch.add_argument(
+            "--nproc_per_node",
+            default=None,
+            help="Processes started on this node. Defaults to the product of the parallel degrees divided by --nnodes.",
+        )
+    xFuserArgs.add_runner_args(parser)
+    parser.print_help()
+
+
 def main(args: Optional[List[str]] = None) -> None:
     """
     Main entry point for the xdit CLI.
@@ -114,6 +158,10 @@ def main(args: Optional[List[str]] = None) -> None:
     """
     if args is None:
         args = sys.argv[1:]
+
+    if _help_requested(args):
+        print_help(prog="xdit", include_launch_args=True)
+        return
 
     # Extract torchrun args and get runner args
     torchrun_values, runner_args = extract_torchrun_args(args)

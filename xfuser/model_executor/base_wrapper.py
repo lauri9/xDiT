@@ -9,7 +9,6 @@ from xfuser.core.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from xfuser.core.distributed.runtime_state import get_runtime_state
-from xfuser.core.fast_attention import get_fast_attn_enable
 
 
 class xFuserBaseWrapper(metaclass=ABCMeta):
@@ -52,3 +51,8 @@ class xFuserBaseWrapper(metaclass=ABCMeta):
             return func(self, *args, **kwargs)
 
         return check_condition_fn
+
+
+# After the class exists. Importing fast attention pulls the layer package, which
+# imports this module back; doing it at the top left xFuserBaseWrapper undefined.
+from xfuser.core.fast_attention import get_fast_attn_enable  # noqa: E402

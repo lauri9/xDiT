@@ -86,6 +86,21 @@ def test_torchrun_flags_are_accepted_with_dashes(monkeypatch):
     assert cmd[cmd.index("xfuser.runner") + 1 :] == ["--model", "m", "--ulysses-degree", "8"]
 
 
+def test_help_prints_usage_without_launching(capsys):
+    cli.main(["--help"])
+
+    out = capsys.readouterr().out
+    assert out.startswith("usage: xdit")
+    assert "--model" in out
+    assert "--nproc_per_node" in out
+
+
+def test_short_help_is_the_same_request(capsys):
+    cli.main(["-h"])
+
+    assert "usage: xdit" in capsys.readouterr().out
+
+
 def test_a_malformed_degree_is_reported_as_an_xdit_usage_error(monkeypatch, capsys):
     launched, exit_status = _launch(monkeypatch, ["--model", "m", "--ulysses_degree", "two"])
 
