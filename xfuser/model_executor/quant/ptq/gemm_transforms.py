@@ -61,6 +61,24 @@ def cfg_combined_hessian(conditional, unconditional, *, guidance):
     return values.T @ values
 
 
+def predicted_activation_recovery(weight, quantized_hessian, cross_moment, *, activation_error2, total_error2):
+    """Optimistic float-target recovery of input-correlated activation error.
+
+    Weight-rounding error is not credited as a compensation gain. This is
+    a precheck upper bound, not the post-GPTQ candidate's measured efficacy.
+    """
+    if total_error2 <= 0 or activation_error2 < 0:
+        raise ValueError("precheck requires positive total and nonnegative activation energy")
+    target,damping = activation_compensating_target(weight,quantized_hessian,cross_moment)
+    delta = target-weight.float()
+    cross_error = cross_moment.float()-quantized_hessian.float()
+    reduction = float(2*(delta @ cross_error*weight.float()).sum()-(delta @ quantized_hessian.float()*delta).sum())
+    return {"damping":damping,"predicted_activation_recovery2":reduction,
+        "predicted_float_target_activation_error2":activation_error2-reduction,
+        "predicted_total_error_reduction":reduction/total_error2,
+        "passes_5pct_precheck":reduction/total_error2>=0.05}
+
+
 def mix_cfg_hessian(pooled, combined, *, fraction):
     if pooled.shape != combined.shape or pooled.ndim != 2 or pooled.shape[0] != pooled.shape[1]:
         raise ValueError("CFG Hessians must be matching square matrices")

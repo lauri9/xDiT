@@ -4,6 +4,7 @@ import torch
 from xfuser.model_executor.quant.ptq.gemm_transforms import (
     activation_compensating_target, block_hadamard, cfg_combined_hessian,
     fold_value_output, mix_cfg_hessian,
+    predicted_activation_recovery,
 )
 from xfuser.model_executor.quant.ptq.mxfp4_ref import (
     dequantize_mxfp4, quantize_mxfp4, quantize_mxfp4_scale_search, quantize_mxfp4_nearest,
@@ -88,3 +89,15 @@ def test_nearest_scale_intentionally_saturates_outlier_instead_of_ceil_grid():
     assert int(near_s[0,0]) == 126
     assert float(dequantize_mxfp4(near_p,near_s)[0,0]) == 3.0
     assert float(dequantize_mxfp4(full_p,full_s)[0,0]) == 3.0
+
+
+def test_precheck_credits_only_activation_recovery_not_removing_weight_error():
+    generator = torch.Generator().manual_seed(31)
+    values = torch.randn(512,32,generator=generator)
+    quantized = values*0.8
+    weight = torch.randn(5,32,generator=generator)
+    activation_error = float(((values-quantized) @ weight.T).square().sum())
+    result = predicted_activation_recovery(weight,quantized.T @ quantized,quantized.T @ values,
+        activation_error2=activation_error,total_error2=activation_error*10)
+    assert result["predicted_total_error_reduction"] == pytest.approx(0.1,rel=0.005)
+    assert result["predicted_float_target_activation_error2"] < activation_error*0.005
