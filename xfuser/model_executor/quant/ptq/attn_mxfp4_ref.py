@@ -114,7 +114,9 @@ def _ungroup_fp6_p(values: torch.Tensor, sequence: int) -> torch.Tensor:
     )[..., :sequence]
 
 
-def quantize_mxfp6_e2m3(values: torch.Tensor) -> torch.Tensor:
+def quantize_mxfp6_e2m3(
+    values: torch.Tensor, *, scale_from_bf16: bool = True
+) -> torch.Tensor:
     """Convert P with one E8M0 scale per interleaved 32-key group.
 
     The pinned gfx950 object converts BF16 to E2M3, with scale exponent
@@ -123,8 +125,13 @@ def quantize_mxfp6_e2m3(values: torch.Tensor) -> torch.Tensor:
     """
 
     sequence = values.shape[-1]
-    grouped = _fp6_p_groups(values.to(torch.bfloat16).to(torch.float32))
-    amax = grouped.abs().amax(dim=-1, keepdim=True)
+    grouped = _fp6_p_groups(values.to(torch.float32))
+    bf16_grouped = grouped.to(torch.bfloat16).to(torch.float32)
+    # Full tiles derive the scale from packed BF16. The standard-exp2 tail
+    # derives it from FP32 before BF16 conversion (object 0xe7d4-0xe904).
+    amax = (bf16_grouped if scale_from_bf16 else grouped).abs().amax(
+        dim=-1, keepdim=True
+    )
     # Extract the BF16 exponent as the object does; this also handles zero
     # groups without log2(0) and preserves exact powers of two.
     exponent = ((amax.contiguous().view(torch.int32) >> 23) & 0xFF) - 2
@@ -135,7 +142,7 @@ def quantize_mxfp6_e2m3(values: torch.Tensor) -> torch.Tensor:
         dtype=torch.float32,
         device=values.device,
     )
-    converted = _round_fp6(grouped / scale, positive) * scale
+    converted = _round_fp6(bf16_grouped / scale, positive) * scale
     return _ungroup_fp6_p(converted, sequence)
 
 
@@ -176,11 +183,16 @@ def _converted_kernel_probability(logits_log2: torch.Tensor) -> torch.Tensor:
         converted = scores[..., :0]
 
     if full_sequence != sequence:
-        tail = scores[..., full_sequence:]
-        tail_max = torch.maximum(seed_max, tail.amax(dim=-1, keepdim=True))
-        raw_tail = torch.exp2((tail - tail_max) * exp_scale) * 2**-63
-        converted_tail = quantize_mxfp6_e2m3(raw_tail)
-        converted = converted * torch.exp2((seed_max - tail_max) * exp_scale)
+        tail = scores[..., full_sequence:] + 1
+        tail_max = torch.maximum(seed_max + 1, tail.amax(dim=-1, keepdim=True))
+        offset = -tail_max * exp_scale
+        # Match multiply-to-FP32 followed by FMA, rather than subtract then
+        # multiply. Even a tiny cancellation error at the maximum can move
+        # the FP32-derived tail scale across a power-of-two boundary.
+        shifted_tail = (tail.double() * exp_scale + offset.double()).float()
+        raw_tail = torch.exp2(shifted_tail) * 2**-63
+        converted_tail = quantize_mxfp6_e2m3(raw_tail, scale_from_bf16=False)
+        converted = converted * torch.exp2((seed_max + 1 - tail_max) * exp_scale)
         converted = torch.cat((converted, converted_tail), dim=-1)
     return converted
 

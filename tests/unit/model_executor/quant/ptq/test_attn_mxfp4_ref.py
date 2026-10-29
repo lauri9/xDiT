@@ -79,7 +79,9 @@ def test_p_conversion_scales_each_key_block_and_rounds_to_even():
 def test_v_midpoints_round_toward_zero_in_both_signs():
     values = torch.zeros((1, 64, 1, 128), dtype=torch.bfloat16)
     rows = torch.tensor([0, 1, 2, 3, 8, 9, 10, 11])
-    values[0, rows, 0, 0] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0])
+    values[0, rows, 0, 0] = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0], dtype=values.dtype,
+    )
     values[..., 1] = -values[..., 0]
 
     actual = quantize_mxfp4_v(values)

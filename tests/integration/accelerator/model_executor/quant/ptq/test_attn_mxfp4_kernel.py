@@ -59,9 +59,9 @@ def test_torch_emulator_matches_mha_v4_mxfp4(sequence):
         actual_f32.flatten(), expected_f32.flatten(), dim=0
     ).item()
 
-    # exp2/online-state approximation: bound residual, not bit-exact agreement.
-    assert cosine >= 0.998, f"S={sequence}: cosine={cosine}, relative_rmse={relative_rmse}"
-    assert relative_rmse <= 0.065, f"S={sequence}: cosine={cosine}, relative_rmse={relative_rmse}"
+    # Bound MFMA accumulation-order residual, not bit-exact agreement.
+    assert cosine >= 0.9999, f"S={sequence}: cosine={cosine}, relative_rmse={relative_rmse}"
+    assert relative_rmse <= 0.015, f"S={sequence}: cosine={cosine}, relative_rmse={relative_rmse}"
 
 
 def test_mxfp4_v_tail_matches_sdpa_at_production_remainder():
