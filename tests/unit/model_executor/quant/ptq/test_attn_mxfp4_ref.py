@@ -58,7 +58,7 @@ def test_v_quantization_blocks_the_sequence_axis_per_channel():
 def test_p_conversion_scales_each_key_block_and_rounds_to_even():
     values = torch.zeros((2, 65))
     values[0, 0] = 1.0
-    values[0, 1:5] = torch.tensor([0.015625, 0.046875, 0.265625, 0.296875])
+    values[0, [1, 2, 3, 8]] = torch.tensor([0.015625, 0.046875, 0.265625, 0.296875])
     odd = torch.arange(64).remainder(8) >= 4
     values[0, :64][odd] = 2.0**-10
     values[0, 64] = 2.0**-20
@@ -67,7 +67,7 @@ def test_p_conversion_scales_each_key_block_and_rounds_to_even():
     actual = quantize_mxfp6_e2m3(values)
 
     torch.testing.assert_close(
-        actual[0, :5], torch.tensor([1.0, 0.0, 0.0625, 0.25, 0.3125]),
+        actual[0, [0, 1, 2, 3, 8]], torch.tensor([1.0, 0.0, 0.0625, 0.25, 0.3125]),
         rtol=0, atol=0,
     )
     torch.testing.assert_close(actual[0, :64][odd], values[0, :64][odd], rtol=0, atol=0)
