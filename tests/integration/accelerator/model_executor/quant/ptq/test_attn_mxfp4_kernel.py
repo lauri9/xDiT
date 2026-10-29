@@ -91,3 +91,18 @@ def test_mxfp4_v_tail_matches_sdpa_at_production_remainder():
         output.float().flatten(), reference.float().flatten(), dim=0
     ).item()
     assert cosine > 0.95
+
+
+@pytest.mark.parametrize("sequence", [384, 4096])
+def test_repeated_probability_overflow_rollback_matches_kernel(sequence):
+    query = torch.ones((1, sequence, 2, 128), dtype=torch.bfloat16, device="cuda")
+    key = torch.zeros_like(query)
+    key[:, 128] = 4
+    key[:, 256] = 8
+    generator = torch.Generator(device="cuda").manual_seed(20261029)
+    value = torch.randn(query.shape, generator=generator, device="cuda").bfloat16()
+    rows = torch.tensor([0, sequence - 1], device="cuda")
+    with torch.no_grad():
+        kernel = _mha_v4_mxfp4(query, key, value).index_select(1, rows)
+        emulator = mxfp4_attention_ref(query.index_select(1, rows), key, value)
+    torch.testing.assert_close(emulator, kernel, rtol=0, atol=0)

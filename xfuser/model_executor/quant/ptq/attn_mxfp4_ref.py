@@ -1,8 +1,8 @@
 """Torch reference for the pinned AITER MHA v4 MXFP4 attention recipe.
 
 The reference models numerical values, including the FP6-P reduction groups
-and packed exponential approximation. It does not reproduce MFMA accumulation
-order, and rejects the unmodeled overflow-rollback path. It is not bit exact.
+and packed exponential approximation with exponent rollback. It does not
+reproduce MFMA accumulation order. It is not bit exact.
 Inputs and outputs use BSHD, matching ``aiter.ops.mha_v4.mha_v4``.
 """
 
@@ -175,9 +175,12 @@ def _converted_kernel_probability(logits_log2: torch.Tensor) -> torch.Tensor:
         shifted = scores[..., :full_sequence] + (magic - seed_max)
         codes = torch.round(shifted.clamp(0, 1) * 65535).to(torch.int32)
         if bool((codes > 0x2FFC).any()):
-            raise NotImplementedError("MHA v4 FP6-P overflow rollback is not modeled")
-        raw = (codes << 16).contiguous().view(torch.float32)
-        converted = quantize_mxfp6_e2m3(raw)
+            converted, seed_max = _packed_probability_rollback(
+                scores[..., :full_sequence], seed_max
+            )
+        else:
+            raw = (codes << 16).contiguous().view(torch.float32)
+            converted = quantize_mxfp6_e2m3(raw)
     else:
         seed_max = scores.amax(dim=-1, keepdim=True)
         converted = scores[..., :0]
@@ -195,6 +198,49 @@ def _converted_kernel_probability(logits_log2: torch.Tensor) -> torch.Tensor:
         converted = converted * torch.exp2((seed_max + 1 - tail_max) * exp_scale)
         converted = torch.cat((converted, converted_tail), dim=-1)
     return converted
+
+
+def _packed_probability_rollback(scores, bias):
+    """Replay exponent-only rollback (object 0x9314-0x983c).
+
+    Rollback shifts each affected query's BF16 codes by a whole exponent,
+    rescales preceding converted P, and increases the carried score bias.
+    Non-overflowing queries receive a zero shift even when their wave branches.
+    Process contiguous spans between rollback events rather than every tile.
+    """
+    magic = float.fromhex("0x1.ffc4p-4")
+    inverse_exp_scale = float.fromhex("0x1.0001p-9")
+    converted = torch.empty_like(scores)
+    position = 0
+    while position < scores.shape[-1]:
+        codes = torch.round(
+            (scores[..., position:] + (magic - bias)).clamp(0, 1) * 65535
+        ).to(torch.int32)
+        maxima = codes.reshape(*codes.shape[:-1], -1, 128).amax(-1)
+        overflow = maxima > 0x2FFC
+        events = overflow.reshape(-1, overflow.shape[-1]).any(0).nonzero()
+        if events.numel() == 0:
+            raw = (codes << 16).contiguous().view(torch.float32)
+            converted[..., position:] = quantize_mxfp6_e2m3(raw)
+            break
+        next_tile = int(events[0, 0])
+        before = next_tile * 128
+        if before:
+            raw = (codes[..., :before] << 16).contiguous().view(torch.float32)
+            converted[..., position:position + before] = quantize_mxfp6_e2m3(raw)
+            position += before
+        maximum = maxima[..., next_tile:next_tile + 1]
+        # ceil((maximum - 0x1ffc) / 128), but only when code > 0x2ffc.
+        shift = torch.where(maximum > 0x2FFC, (maximum - 0x1FFC + 127) >> 7, 0)
+        factor = ((127 - shift).clamp(min=0) << 23).contiguous().view(torch.float32)
+        converted[..., :position] *= factor
+        current = codes[..., before:before + 128]
+        current = (current - (shift << 7)).clamp(min=0)
+        raw = (current << 16).contiguous().view(torch.float32)
+        converted[..., position:position + 128] = quantize_mxfp6_e2m3(raw)
+        bias = bias + shift.float() * inverse_exp_scale
+        position += 128
+    return converted, bias
 
 
 def _mxfp4_rows(values: torch.Tensor) -> torch.Tensor:

@@ -91,13 +91,15 @@ def test_v_midpoints_round_toward_zero_in_both_signs():
     torch.testing.assert_close(actual[0, rows, 0, 1], -expected, rtol=0, atol=0)
 
 
-def test_unmodeled_probability_overflow_rollback_is_rejected():
+def test_probability_overflow_rollback_preserves_normalization():
     query = torch.ones((1, 1, 1, 128), dtype=torch.bfloat16)
     key = torch.zeros((1, 256, 1, 128), dtype=torch.bfloat16)
     key[:, 200] = 8
 
-    with pytest.raises(NotImplementedError, match="overflow rollback"):
-        mxfp4_attention_ref(query, key, torch.zeros_like(key))
+    value = torch.zeros_like(key)
+    value[:, 200] = 1
+    actual = mxfp4_attention_ref(query, key, value)
+    torch.testing.assert_close(actual, torch.ones_like(query), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("sequence", [33, 4096])
