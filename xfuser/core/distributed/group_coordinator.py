@@ -33,9 +33,6 @@ logger = init_logger(__name__)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
-env_info = envs.PACKAGES_CHECKER.get_packages_info()
-HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
-
 
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]], prefix: str = ""
@@ -996,7 +993,8 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             local_rank=local_rank,
             torch_distributed_backend=torch_distributed_backend,
         )
-        if HAS_LONG_CTX_ATTN:
+        # Same deferral as parallel_state: importing this module must not import yunchang.
+        if envs.PACKAGES_CHECKER.get_packages_info()["has_long_ctx_attn"]:
             ulysses_group = kwargs.get("ulysses_group", None)
             ring_group = kwargs.get("ring_group", None)
             if ulysses_group is None:

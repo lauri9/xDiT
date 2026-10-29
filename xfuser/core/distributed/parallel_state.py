@@ -29,10 +29,6 @@ except ModuleNotFoundError:
 
 from .utils import RankGenerator
 
-env_info = envs.PACKAGES_CHECKER.get_packages_info()
-HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
-HAS_FLASH_ATTN = env_info["has_flash_attn"]
-
 logger = init_logger(__name__)
 
 
@@ -510,8 +506,9 @@ def initialize_model_parallel(
     global _SP
     assert _SP is None, "sequence parallel group is already initialized"
 
-    # if HAS_LONG_CTX_ATTN and sequence_parallel_degree > 1:
-    if HAS_LONG_CTX_ATTN:
+    # Read here, not at import: yunchang pulls AITER in with it, and a worker that never
+    # builds a sequence-parallel group should not pay for either.
+    if envs.PACKAGES_CHECKER.get_packages_info()["has_long_ctx_attn"]:
         from yunchang import set_seq_parallel_pg
         from yunchang.globals import PROCESS_GROUP
 

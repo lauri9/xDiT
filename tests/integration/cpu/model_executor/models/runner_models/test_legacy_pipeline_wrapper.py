@@ -125,7 +125,9 @@ def _worker(rank, world_size, init_method, result_queue, *, degrees, use_paralle
             patch.object(torch.cuda, "Event", Mock()),
             patch.object(torch.cuda, "synchronize", lambda: None),
             # Only the optional yunchang package is missing; no attention runs here.
-            patch.object(config_module, "HAS_LONG_CTX_ATTN", True),
+            # Patches the config gate, not the process-group setup, which still takes the
+            # path that does not import yunchang.
+            patch.object(config_module, "long_ctx_attn_available", lambda: True),
             torch.no_grad(),
         ):
             parallel_state.init_distributed_environment(

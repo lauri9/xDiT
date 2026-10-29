@@ -20,22 +20,41 @@ import torch.distributed as dist
 import xfuser.envs as envs
 from xfuser.logger import init_logger
 
-# The dtype the kernel will actually quantise to: e4m3fnuz on gfx942, e4m3fn on
-# gfx950, and their maxima differ (240 vs 448), so the calibration scale depends
-# on which one it is. The fallback only matters on a machine without AITER,
-# where fp8 comms cannot run at all.
-try:
-    from aiter.dtypes import fp8 as _FP8_DTYPE
-except Exception:                       # noqa: BLE001 - absence is the answer
-    _FP8_DTYPE = torch.float8_e4m3fn
 from xfuser.config.config import DEFAULT_FP8_COMMS_SAFETY_FACTOR
 
-if torch.cuda.is_available() or envs._is_npu():
-    from yunchang.globals import PROCESS_GROUP
-else:
-    PROCESS_GROUP = None
-
 logger = init_logger(__name__)
+
+
+def _fp8_dtype():
+    """The dtype the kernel quantises to. e4m3fnuz on gfx942, e4m3fn on gfx950.
+
+    Their maxima differ (240 vs 448), so the calibration scale depends on which one
+    it is. Resolved on first use: importing aiter.dtypes loads the whole AITER
+    package, and a worker that never calibrates fp8 comms should not pay for that.
+    The fallback only matters on a machine without AITER, where fp8 comms cannot run.
+    """
+    cached = getattr(_fp8_dtype, "_value", None)
+    if cached is not None:
+        return cached
+    try:
+        from aiter.dtypes import fp8 as dtype
+    except Exception:  # noqa: BLE001 - absence is the answer
+        dtype = torch.float8_e4m3fn
+    _fp8_dtype._value = dtype
+    return dtype
+
+
+def _ulysses_process_group():
+    """Yunchang's Ulysses group, or None where sequence-parallel comms are unavailable.
+
+    Importing yunchang imports AITER on ROCm. Callers that actually reduce across the
+    Ulysses group are the ones that need it.
+    """
+    if not (torch.cuda.is_available() or envs._is_npu()):
+        return None
+    from yunchang.globals import PROCESS_GROUP
+
+    return PROCESS_GROUP.ULYSSES_PG
 
 _FP8_LOG_SCALES = os.environ.get("XFUSER_FP8_LOG_SCALES", "").lower() in ("1", "true")
 class Fp8CommsCall(NamedTuple):
@@ -232,7 +251,7 @@ class Fp8CommsState:
                 f"AITER_FLYDSL_FP8) on the self-attention layers: check that the bound "
                 f"attention modules are the ones USP actually runs."
             )
-        dtype_max = torch.finfo(_FP8_DTYPE).max
+        dtype_max = torch.finfo(_fp8_dtype()).max
         maxes = torch.stack(
             [
                 model_state.q_running_max,
@@ -242,7 +261,7 @@ class Fp8CommsState:
             ],
             dim=0,
         )
-        dist.all_reduce(maxes, op=dist.ReduceOp.MAX, group=PROCESS_GROUP.ULYSSES_PG)
+        dist.all_reduce(maxes, op=dist.ReduceOp.MAX, group=_ulysses_process_group())
         # A smaller safety_factor enlarges the scale so live values above the
         # calibrated amax still map below FP8_MAX -> no clipping. Free for fp8.
         scales = maxes.clamp(min=1e-6) / (dtype_max * self.safety_factor)

@@ -48,11 +48,14 @@ from xfuser.core.fast_attention import (
 from xfuser.model_executor.base_wrapper import xFuserBaseWrapper
 from xfuser.model_executor.pipefusion import pipefusion_should_update_progress
 
-from xfuser.envs import PACKAGES_CHECKER
+from xfuser.envs import PACKAGES_CHECKER, ensure_rocm_libraries
 
 from distvae.vae import parallelize_decoder
 
 PACKAGES_CHECKER.check_diffusers_version()
+# Pipeline classes build GroupNorm during from_pretrained. Swap in AITER's before that,
+# and not while xfuser.envs itself is importing.
+ensure_rocm_libraries()
 
 # These imports follow the diffusers version check on purpose.
 from xfuser.model_executor.schedulers import xFuserSchedulerBaseWrapper, xFuserSchedulerWrappersRegister  # noqa: E402

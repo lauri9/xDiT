@@ -10,11 +10,12 @@ from xfuser.logger import init_logger
 
 logger = init_logger(__name__)
 
-env_info = PACKAGES_CHECKER.get_packages_info()
-HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
-
 DEFAULT_FP8_COMMS_SAFETY_FACTOR = 0.85
-HAS_FLASH_ATTN = env_info["has_flash_attn"]
+
+
+def long_ctx_attn_available() -> bool:
+    """Whether yunchang is installed. Resolved on call so importing config does not import it."""
+    return bool(PACKAGES_CHECKER.get_packages_info()["has_long_ctx_attn"])
 
 
 def check_packages():
@@ -152,7 +153,9 @@ class SequenceParallelConfig:
             self.shard_dit = False
             logger.info("Sequence parallelism not set, model sharding disabled")
 
-        if not HAS_LONG_CTX_ATTN and self.sp_degree > 1:
+        # sp_degree == 1 is the default. Checking yunchang first would import it (and, on
+        # ROCm, AITER) for every config, including workers that never use sequence parallelism.
+        if self.sp_degree > 1 and not long_ctx_attn_available():
             raise ImportError(
                 f"Sequence Parallel kit 'yunchang' not found but "
                 f"sp_degree is {self.sp_degree}, please set it "

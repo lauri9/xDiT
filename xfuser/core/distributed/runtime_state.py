@@ -1,13 +1,18 @@
+from __future__ import annotations
+
 from abc import ABCMeta
 import random
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
 from torch.cuda import manual_seed as device_manual_seed
 from torch.cuda import manual_seed_all as device_manual_seed_all
-from diffusers import DiffusionPipeline
 import torch.distributed
+
+if TYPE_CHECKING:
+    # Annotations only. A runtime import here loads diffusers into every distributed worker.
+    from diffusers import DiffusionPipeline
 
 try:
     import torch_musa  # noqa: F401
@@ -51,7 +56,6 @@ from .parallel_state import (
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
-from xfuser.config.args import xFuserArgs
 
 logger = init_logger(__name__)
 
@@ -976,6 +980,9 @@ def _default_engine_config() -> EngineConfig:
     degrees of the model-parallel groups when they are initialized; otherwise
     every rank runs the whole model, as one data-parallel replica.
     """
+    # Imported here so config.args can import this package while it is still loading.
+    from xfuser.config.args import xFuserArgs
+
     args = xFuserArgs()
     if model_parallel_is_initialized():
         args.data_parallel_degree = get_data_parallel_world_size()

@@ -1,6 +1,5 @@
 import os
 import torch
-import diffusers
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 from packaging import version
 
@@ -190,29 +189,32 @@ except (AttributeError, ModuleNotFoundError):
     pass
 
 
+class _LazyPackagesInfo(dict):
+    """Package probes run on first read of that key, not when xfuser.envs is imported.
+
+    ``get_packages_info()`` is called from module scope in several places. Filling every
+    key there imported diffusers, yunchang and AITER into workers that only gather a tensor.
+    """
+
+    def __getitem__(self, key):
+        if key not in self and key in _PACKAGE_CHECKS:
+            self[key] = _PACKAGE_CHECKS[key](PACKAGES_CHECKER)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key not in self and key in _PACKAGE_CHECKS:
+            self[key]
+        return super().get(key, default)
+
+
 class PackagesEnvChecker:
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(PackagesEnvChecker, cls).__new__(cls)
-            cls._instance.initialize()
+            cls._instance.packages_info = _LazyPackagesInfo()
         return cls._instance
-
-    def initialize(self):
-        packages_info = {}
-        packages_info["has_aiter"] = self.check_aiter()
-        packages_info["has_flash_attn"] = self.check_flash_attn()
-        packages_info["has_flash_attn_3"] = self._check_flash_attn_3()
-        packages_info["has_flash_attn_4"] = self._check_flash_attn_4()
-        packages_info["has_flash_attn_4_fp4"] = self._check_flash_attn_4_fp4()
-        packages_info["has_transformer_engine"] = self.check_transformer_engine()
-        packages_info["has_sage"] = self._check_sage()
-        packages_info["has_flex_block_attn"] = self._check_flex_block_attn()
-        packages_info["has_long_ctx_attn"] = self.check_long_ctx_attn()
-        packages_info["diffusers_version"] = self.check_diffusers_version()
-        packages_info["has_npu_flash_attn"] = self.check_npu_flash_attn()
-        self.packages_info = packages_info
 
     def check_aiter(self):
         """
@@ -359,6 +361,8 @@ class PackagesEnvChecker:
             return False
 
     def check_diffusers_version(self):
+        import diffusers
+
         if version.parse(version.parse(diffusers.__version__).base_version) < version.parse("0.30.0"):
             raise RuntimeError(
                 f"Diffusers version: {version.parse(version.parse(diffusers.__version__).base_version)} is not supported,"
@@ -390,6 +394,21 @@ class PackagesEnvChecker:
         return any(arch in gcn_arch_name for arch in ["gfx1200", "gfx1201"])
 
 
+# Bound after the methods exist. Lookups go through the singleton, which is assigned below.
+_PACKAGE_CHECKS = {
+    "has_aiter": PackagesEnvChecker.check_aiter,
+    "has_flash_attn": PackagesEnvChecker.check_flash_attn,
+    "has_flash_attn_3": PackagesEnvChecker._check_flash_attn_3,
+    "has_flash_attn_4": PackagesEnvChecker._check_flash_attn_4,
+    "has_flash_attn_4_fp4": PackagesEnvChecker._check_flash_attn_4_fp4,
+    "has_transformer_engine": PackagesEnvChecker.check_transformer_engine,
+    "has_sage": PackagesEnvChecker._check_sage,
+    "has_flex_block_attn": PackagesEnvChecker._check_flex_block_attn,
+    "has_long_ctx_attn": PackagesEnvChecker.check_long_ctx_attn,
+    "diffusers_version": PackagesEnvChecker.check_diffusers_version,
+    "has_npu_flash_attn": PackagesEnvChecker.check_npu_flash_attn,
+}
+
 PACKAGES_CHECKER = PackagesEnvChecker()
 _TORCH_GROUPNORM = torch.nn.GroupNorm
 
@@ -406,22 +425,28 @@ def restore_torch_group_norm_for_distvae() -> bool:
     return True
 
 
-def _setup_rocm_libraries():
-    if PACKAGES_CHECKER.packages_info.get("has_aiter", False):
-        try:
-            from aiter.ops.groupnorm import GroupNorm
+def ensure_rocm_libraries() -> None:
+    """Install AITER GroupNorm once, before any module that should use it is built.
 
-            torch.nn.GroupNorm = GroupNorm
-            logger.info("Using AITER GroupNorm as torch.nn.GroupNorm")
-        except ImportError:
-            logger.warning(
-                "Using AITER but AITER GroupNorm is not available, please update AITER. "
-                "Defaulting to torch GroupNorm implementation"
-            )
-
-
-if _is_hip():
-    _setup_rocm_libraries()
+    Importing xfuser used to do this immediately, so every worker loaded AITER before it
+    knew whether a model would be constructed. Call this from the path that is about to
+    build those modules. A second call does nothing.
+    """
+    if getattr(ensure_rocm_libraries, "_done", False):
+        return
+    ensure_rocm_libraries._done = True
+    if not _is_hip() or not PACKAGES_CHECKER.check_aiter():
+        return
+    try:
+        from aiter.ops.groupnorm import GroupNorm
+    except ImportError:
+        logger.warning(
+            "Using AITER but AITER GroupNorm is not available, please update AITER. "
+            "Defaulting to torch GroupNorm implementation"
+        )
+        return
+    torch.nn.GroupNorm = GroupNorm
+    logger.info("Using AITER GroupNorm as torch.nn.GroupNorm")
 
 
 def __getattr__(name):

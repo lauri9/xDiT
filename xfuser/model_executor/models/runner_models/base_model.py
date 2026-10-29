@@ -18,6 +18,7 @@ from xfuser.envs import (
     PACKAGES_CHECKER,
     _is_hip,
     _is_cuda,
+    ensure_rocm_libraries,
 )
 from xfuser.core.utils.outputs_equal import outputs_equal
 from xfuser.logger import warn_once
@@ -490,6 +491,9 @@ class xFuserModel(abc.ABC):
             getattr(self.config, "pipefusion_parallel_degree", 1) > 1
         )
         log("Loading model pipeline...")
+        # Runners load diffusers pipelines directly, without importing the legacy
+        # pipeline package that performs this swap.
+        ensure_rocm_libraries()
         self.pipe = self._load_model_checked()
         enable_fast_pil_postprocess([self.pipe, getattr(self, "second_pipe", None)])
         self._legacy_pipe = self.pipe if isinstance(self.pipe, xFuserPipelineBaseWrapper) else None

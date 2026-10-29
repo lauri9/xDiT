@@ -52,9 +52,9 @@ else:
 
 logger = init_logger(__name__)
 
-env_info = PACKAGES_CHECKER.get_packages_info()
-HAS_AITER = env_info["has_aiter"]
-HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
+# has_aiter is intentionally not read here. This module is imported with the pipelines,
+# and probing AITER at import loaded it before a backend had been selected.
+HAS_LONG_CTX_ATTN = PACKAGES_CHECKER.get_packages_info()["has_long_ctx_attn"]
 
 
 def _joint_sp_padding_attention_kwargs(query, encoder_query):
