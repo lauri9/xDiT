@@ -6,13 +6,14 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from .prequantized_load import PackedLinearSpec
+if TYPE_CHECKING:
+    from .prequantized_load import PackedLinearSpec
 
 
 FORMAT_VERSION = 1
@@ -37,6 +38,8 @@ class PTQArtifact:
         return str(self.config["artifact_id"])
 
     def specs_for_component(self, component_name: str) -> tuple[PackedLinearSpec, ...]:
+        from .prequantized_load import PackedLinearSpec
+
         prefix = f"{component_name}."
         specs = []
         for full_name, entry in self.config["layers"].items():
