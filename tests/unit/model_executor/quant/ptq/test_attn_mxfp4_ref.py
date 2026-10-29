@@ -42,23 +42,25 @@ def test_fp6_e3m2_uses_round_to_nearest_even():
 
 
 def test_v_quantization_blocks_the_sequence_axis_per_channel():
-    values = torch.zeros((1, 33, 1, 128), dtype=torch.bfloat16)
-    values[:, :32, :, 0] = 0.5
-    values[:, 32:, :, 0] = 12.0
+    values = torch.zeros((1, 65, 1, 128), dtype=torch.bfloat16)
+    even = torch.arange(64).remainder(8) < 4
+    values[:, :64, :, 0] = torch.where(even, 0.5, 12.0).reshape(1, 64, 1)
+    values[:, 64:, :, 0] = 3.0
     values[:, :, :, 1] = 3.0
 
     actual = quantize_mxfp4_v(values)
 
-    torch.testing.assert_close(actual[:, :32, :, 0], torch.full((1, 32, 1), 0.5))
-    torch.testing.assert_close(actual[:, 32:, :, 0], torch.full((1, 1, 1), 12.0))
-    torch.testing.assert_close(actual[:, :, :, 1], torch.full((1, 33, 1), 3.0))
+    torch.testing.assert_close(actual[:, :64, :, 0], values[:, :64, :, 0].float())
+    torch.testing.assert_close(actual[:, 64:, :, 0], torch.full((1, 1, 1), 3.0))
+    torch.testing.assert_close(actual[:, :, :, 1], torch.full((1, 65, 1), 3.0))
 
 
 def test_p_conversion_scales_each_key_block_and_rounds_to_even():
     values = torch.zeros((2, 65))
     values[0, 0] = 1.0
     values[0, 1:5] = torch.tensor([0.015625, 0.046875, 0.265625, 0.296875])
-    values[0, 32:64] = 2.0**-10
+    odd = torch.arange(64).remainder(8) >= 4
+    values[0, :64][odd] = 2.0**-10
     values[0, 64] = 2.0**-20
     values[1] = values[0] * 8
 
@@ -68,7 +70,8 @@ def test_p_conversion_scales_each_key_block_and_rounds_to_even():
         actual[0, :5], torch.tensor([1.0, 0.0, 0.0625, 0.25, 0.3125]),
         rtol=0, atol=0,
     )
-    torch.testing.assert_close(actual[0, 32:], values[0, 32:], rtol=0, atol=0)
+    torch.testing.assert_close(actual[0, :64][odd], values[0, :64][odd], rtol=0, atol=0)
+    torch.testing.assert_close(actual[0, 64:], values[0, 64:], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], actual[0] * 8, rtol=0, atol=0)
     assert torch.isfinite(quantize_mxfp6_e2m3(torch.zeros((1, 32)))).all()
 

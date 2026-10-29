@@ -12,7 +12,7 @@ import math
 
 import torch
 
-from .mxfp4_ref import dequantize_mxfp4, quantize_mxfp4
+from .mxfp4_ref import decode_e8m0, dequantize_mxfp4, quantize_mxfp4
 
 
 HEAD_DIM = 128
@@ -96,8 +96,26 @@ def _round_fp6(values: torch.Tensor, positive: torch.Tensor) -> torch.Tensor:
     return torch.copysign(rounded, values.to(torch.float32))
 
 
+def _fp6_p_groups(values: torch.Tensor) -> torch.Tensor:
+    # gfx950 FP6-P groups alternate four-token chunks in each 64-key half:
+    # {0:4, 8:12, ..., 56:60} and {4:8, 12:16, ..., 60:64}.
+    sequence = values.shape[-1]
+    padded = math.ceil(sequence / 64) * 64
+    values = torch.nn.functional.pad(values, (0, padded - sequence))
+    return values.reshape(*values.shape[:-1], -1, 8, 2, 4).transpose(-3, -2).reshape(
+        *values.shape[:-1], -1, MX_BLOCK_SIZE
+    )
+
+
+def _ungroup_fp6_p(values: torch.Tensor, sequence: int) -> torch.Tensor:
+    prefix = values.shape[:-2]
+    return values.reshape(*prefix, -1, 2, 8, 4).transpose(-3, -2).reshape(
+        *prefix, -1
+    )[..., :sequence]
+
+
 def quantize_mxfp6_e2m3(values: torch.Tensor) -> torch.Tensor:
-    """Convert P with one E8M0 scale per 32 keys along the last dimension.
+    """Convert P with one E8M0 scale per interleaved 32-key group.
 
     The pinned gfx950 object converts BF16 to E2M3, with scale exponent
     ``max(floor(log2(amax)) - 2, -126)``. Ragged groups are zero padded,
@@ -105,13 +123,7 @@ def quantize_mxfp6_e2m3(values: torch.Tensor) -> torch.Tensor:
     """
 
     sequence = values.shape[-1]
-    padded_sequence = math.ceil(sequence / MX_BLOCK_SIZE) * MX_BLOCK_SIZE
-    bf16_values = values.to(torch.bfloat16).to(torch.float32)
-    if padded_sequence != sequence:
-        bf16_values = torch.nn.functional.pad(
-            bf16_values, (0, padded_sequence - sequence)
-        )
-    grouped = bf16_values.reshape(*values.shape[:-1], -1, MX_BLOCK_SIZE)
+    grouped = _fp6_p_groups(values.to(torch.bfloat16).to(torch.float32))
     amax = grouped.abs().amax(dim=-1, keepdim=True)
     # Extract the BF16 exponent as the object does; this also handles zero
     # groups without log2(0) and preserves exact powers of two.
@@ -124,7 +136,7 @@ def quantize_mxfp6_e2m3(values: torch.Tensor) -> torch.Tensor:
         device=values.device,
     )
     converted = _round_fp6(grouped / scale, positive) * scale
-    return converted.reshape(*values.shape[:-1], padded_sequence)[..., :sequence]
+    return _ungroup_fp6_p(converted, sequence)
 
 
 def _attention_probability(logits_log2: torch.Tensor, *, quantized: bool):
@@ -144,18 +156,27 @@ def _mxfp4_rows(values: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_mxfp4_v(values: torch.Tensor) -> torch.Tensor:
-    """Quantize V per channel over blocks of 32 sequence positions."""
+    """Quantize V per channel over the FP6-P interleaved 32-key groups.
+
+    Unlike Q/K, the pinned V quantizer nudges magnitudes down one FP32 ULP
+    before conversion, so exact FP4 midpoints round toward zero.
+    """
 
     if values.ndim != 4 or values.shape[-1] != HEAD_DIM:
         raise ValueError("V must be BSHD with head dimension 128")
     batch, sequence, heads, channels = values.shape
-    padded_sequence = math.ceil(sequence / MX_BLOCK_SIZE) * MX_BLOCK_SIZE
     channel_rows = values.permute(0, 2, 3, 1).to(torch.float32)
-    if padded_sequence != sequence:
-        channel_rows = torch.nn.functional.pad(
-            channel_rows, (0, padded_sequence - sequence)
-        )
-    quantized = _mxfp4_rows(channel_rows)[..., :sequence]
+    grouped = _fp6_p_groups(channel_rows)
+    amax = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    bits = amax.contiguous().view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) - 2 + ((bits & 0x7FFFFF) > 0x400000)
+    scale = decode_e8m0(exponent.clamp(0, 255).to(torch.uint8))
+    normalized = grouped / scale
+    nudged = torch.nextafter(normalized, torch.zeros_like(normalized))
+    positive = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=values.device,
+    )
+    quantized = _ungroup_fp6_p(_round_fp6(nudged, positive) * scale, sequence)
     return quantized.permute(0, 3, 1, 2).reshape(
         batch, sequence, heads, channels
     )
