@@ -31,6 +31,7 @@ from .calibrate import (
 from .mxfp4_ref import dequantize_mxfp4, quantize_mxfp4
 from .attn_mxfp4_ref import mxfp4_attention_decomposition
 from .attn_transforms import load_attention_artifact
+from .observers import wan_block_hessian_groups
 from .provenance import runtime_manifest
 
 
@@ -236,6 +237,97 @@ class TraceHooks:
             handle.remove()
 
 
+class Bf16BlockIntervention:
+    """Restore selected low-noise block GEMMs for a timestep/CFG-branch slice."""
+
+    def __init__(
+        self,
+        transformer,
+        *,
+        blocks: tuple[int, ...],
+        global_steps: tuple[int, ...],
+        branch: str,
+    ):
+        from .quantize import _checkpoint_map, _read_weight
+
+        if not blocks:
+            raise ValueError("BF16 block intervention requires at least one block")
+        if min(blocks) < 0 or max(blocks) >= len(transformer.blocks):
+            raise ValueError(
+                "BF16 intervention block is outside "
+                f"[0, {len(transformer.blocks)})"
+            )
+        if not global_steps or min(global_steps) < 7 or max(global_steps) > 19:
+            raise ValueError("low-noise BF16 intervention steps must be within [7, 19]")
+        if branch not in ("both", "conditional", "unconditional"):
+            raise ValueError(f"unsupported CFG intervention branch: {branch}")
+
+        device = str(next(transformer.parameters()).device)
+        weight_map = _checkpoint_map(MODEL_ID, MODEL_REVISION, "transformer_2")
+        selected_local_steps = frozenset(step - 7 for step in global_steps)
+        self.handles = []
+        self.weights = []
+        for block_index in blocks:
+            for group in wan_block_hessian_groups(block_index):
+                for module_name in group.linears:
+                    module = transformer.get_submodule(module_name)
+                    weight = _read_weight(
+                        weight_map,
+                        f"{module_name}.weight",
+                        device,
+                    ).to(torch.bfloat16)
+                    self.weights.append(weight)
+                    calls = [0]
+
+                    def replace(
+                        _module,
+                        inputs,
+                        output,
+                        *,
+                        bf16_weight=weight,
+                        counter=calls,
+                    ):
+                        call = counter[0]
+                        counter[0] += 1
+                        local_step, branch_index = divmod(call, 2)
+                        call_branch = (
+                            "conditional" if branch_index == 0 else "unconditional"
+                        )
+                        if (
+                            local_step not in selected_local_steps
+                            or branch not in ("both", call_branch)
+                        ):
+                            return output
+                        return F.linear(inputs[0], bf16_weight, _module.bias)
+
+                    self.handles.append(module.register_forward_hook(replace))
+
+    def remove(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        self.weights.clear()
+
+
+def _parse_int_ranges(value: str) -> tuple[int, ...]:
+    """Parse comma-separated integers and inclusive ranges."""
+
+    values = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, stop_text = item.split("-", 1)
+            start, stop = int(start_text), int(stop_text)
+            if stop < start:
+                raise ValueError(f"descending integer range: {item}")
+            values.update(range(start, stop + 1))
+        else:
+            values.add(int(item))
+    return tuple(sorted(values))
+
+
 class AttentionDecompositionHooks:
     """Decompose attention error at fixed layers/calls over the full K/V context."""
 
@@ -432,6 +524,9 @@ def run_arm(
     force_reference_trajectory: bool,
     layer_metrics: bool,
     attention_decomposition: bool,
+    bf16_intervention_blocks: tuple[int, ...] = (),
+    bf16_intervention_steps: tuple[int, ...] = (),
+    bf16_intervention_branch: str = "both",
 ) -> Path:
     from xfuser.core.distributed import init_distributed_environment
     from xfuser.model_executor.models.runner_models.base_model import MODEL_REGISTRY
@@ -491,6 +586,21 @@ def run_arm(
         "seed": 42,
     }
     model.initialize(input_args)
+    if bool(bf16_intervention_blocks) != bool(bf16_intervention_steps):
+        raise ValueError(
+            "BF16 intervention requires both --bf16-intervention-blocks and "
+            "--bf16-intervention-steps"
+        )
+    intervention = (
+        Bf16BlockIntervention(
+            model.pipe.transformer_2,
+            blocks=bf16_intervention_blocks,
+            global_steps=bf16_intervention_steps,
+            branch=bf16_intervention_branch,
+        )
+        if bf16_intervention_blocks
+        else None
+    )
     fixed_latent = torch.load(
         fixed_latent_path, map_location="cpu", weights_only=True
     )
@@ -511,6 +621,17 @@ def run_arm(
         "prompt_count": len(prompts),
         "fixed_latent_sha256": hashlib.sha256(fixed_latent_path.read_bytes()).hexdigest(),
         "force_reference_trajectory": force_reference_trajectory,
+        "bf16_block_intervention": (
+            {
+                "component": "transformer_2",
+                "blocks": list(bf16_intervention_blocks),
+                "global_steps": list(bf16_intervention_steps),
+                "branch": bf16_intervention_branch,
+                "cfg_call_order": ["conditional", "unconditional"],
+            }
+            if intervention is not None
+            else None
+        ),
         "attention_backend": args.attention_backend,
         "prompts": [],
     }
@@ -612,6 +733,8 @@ def run_arm(
                 }
             )
     finally:
+        if intervention is not None:
+            intervention.remove()
         if layer_hook is not None:
             reports = layer_hook.remove()
             (output_dir / "rung1-layer-error.json").write_text(
@@ -1454,6 +1577,21 @@ def _parse_args():
     run.add_argument("--force-reference-trajectory", action="store_true")
     run.add_argument("--layer-metrics", action="store_true")
     run.add_argument("--attention-decomposition", action="store_true")
+    run.add_argument(
+        "--bf16-intervention-blocks",
+        default="",
+        help="Low-noise block indices restored to BF16, e.g. 16-24.",
+    )
+    run.add_argument(
+        "--bf16-intervention-steps",
+        default="",
+        help="Global low-noise denoising steps restored to BF16, e.g. 15-19.",
+    )
+    run.add_argument(
+        "--bf16-intervention-branch",
+        choices=("both", "conditional", "unconditional"),
+        default="both",
+    )
     compare = subparsers.add_parser("compare")
     compare.add_argument("--reference-dir", type=Path, required=True)
     compare.add_argument("--arm-dir", type=Path, action="append", required=True)
@@ -1493,6 +1631,13 @@ if __name__ == "__main__":
                 force_reference_trajectory=cli.force_reference_trajectory,
                 layer_metrics=cli.layer_metrics,
                 attention_decomposition=cli.attention_decomposition,
+                bf16_intervention_blocks=_parse_int_ranges(
+                    cli.bf16_intervention_blocks
+                ),
+                bf16_intervention_steps=_parse_int_ranges(
+                    cli.bf16_intervention_steps
+                ),
+                bf16_intervention_branch=cli.bf16_intervention_branch,
             )
         )
     elif cli.command == "compare":

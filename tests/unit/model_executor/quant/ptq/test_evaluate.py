@@ -7,10 +7,12 @@ import torch
 from xfuser.model_executor.quant.ptq import evaluate
 from xfuser.model_executor.quant.ptq.evaluate import (
     AttentionDecompositionHooks,
+    Bf16BlockIntervention,
     ErrorSums,
     StepTimer,
     _callback,
     _eval_args,
+    _parse_int_ranges,
     _sample_rows,
     _velocity_metrics,
     aggregate_reports,
@@ -48,6 +50,51 @@ def test_sample_rows_is_deterministic_and_bounded():
 
     assert sampled.shape == (3, 4)
     torch.testing.assert_close(sampled, values[[0, 4, 9]])
+
+
+def test_parse_int_ranges_accepts_ranges_and_deduplicates():
+    assert _parse_int_ranges("16-18,17,20") == (16, 17, 18, 20)
+
+
+def test_bf16_block_intervention_selects_timestep_and_cfg_branch(monkeypatch):
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 1, bias=False)
+            self.linear.weight.data.zero_()
+            self.linear.to(torch.bfloat16)
+
+    class Transformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([Block()])
+
+    group = SimpleNamespace(linears=("blocks.0.linear",))
+    monkeypatch.setattr(evaluate, "wan_block_hessian_groups", lambda _index: (group,))
+    monkeypatch.setattr(
+        "xfuser.model_executor.quant.ptq.quantize._checkpoint_map",
+        lambda *_args: {"blocks.0.linear.weight": "unused"},
+    )
+    monkeypatch.setattr(
+        "xfuser.model_executor.quant.ptq.quantize._read_weight",
+        lambda *_args: torch.ones((1, 2)),
+    )
+    transformer = Transformer()
+    intervention = Bf16BlockIntervention(
+        transformer,
+        blocks=(0,),
+        global_steps=(8,),
+        branch="conditional",
+    )
+    values = torch.ones((1, 2), dtype=torch.bfloat16)
+
+    outputs = [transformer.blocks[0].linear(values) for _ in range(4)]
+    intervention.remove()
+
+    torch.testing.assert_close(outputs[0], torch.zeros((1, 1), dtype=torch.bfloat16))
+    torch.testing.assert_close(outputs[1], torch.zeros((1, 1), dtype=torch.bfloat16))
+    torch.testing.assert_close(outputs[2], torch.full((1, 1), 2.0, dtype=torch.bfloat16))
+    torch.testing.assert_close(outputs[3], torch.zeros((1, 1), dtype=torch.bfloat16))
 
 
 def test_rtn_uses_pure_fp4_for_both_wan_experts():
