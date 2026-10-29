@@ -1,9 +1,9 @@
 """Torch reference for the pinned AITER MHA v4 MXFP4 attention recipe.
 
-The reference models numerical values, not AITER's packed tile layouts. It uses
-standard exp2 rather than the object's packed exponential/online rollback
-arithmetic, so it is not a bit-exact kernel emulator. Inputs and outputs use
-BSHD, matching ``aiter.ops.mha_v4.mha_v4``.
+The reference models numerical values, including the FP6-P reduction groups
+and packed exponential approximation. It does not reproduce MFMA accumulation
+order, and rejects the unmodeled overflow-rollback path. It is not bit exact.
+Inputs and outputs use BSHD, matching ``aiter.ops.mha_v4.mha_v4``.
 """
 
 from __future__ import annotations
@@ -140,12 +140,49 @@ def quantize_mxfp6_e2m3(values: torch.Tensor) -> torch.Tensor:
 
 
 def _attention_probability(logits_log2: torch.Tensor, *, quantized: bool):
+    if quantized:
+        unnormalized = _converted_kernel_probability(logits_log2)
+        return unnormalized / unnormalized.sum(dim=-1, keepdim=True)
     shifted = logits_log2 - logits_log2.amax(dim=-1, keepdim=True)
     unnormalized = torch.exp2(shifted)
-    if quantized:
-        unnormalized = quantize_mxfp6_e2m3(unnormalized)
-    # The denominator uses the same converted P as the PV numerator.
     return unnormalized / unnormalized.sum(dim=-1, keepdim=True)
+
+
+def _converted_kernel_probability(logits_log2: torch.Tensor) -> torch.Tensor:
+    """Model the normal dense FP6-P path, including a standard-exp2 tail.
+
+    QK's K scales subtract nine exponent bits. A 128-key seed tile establishes
+    a carried bias; UNORM16 codes are reinterpreted as BF16 P. Subsequent full
+    tiles keep that bias (not a new max each tile). The partial final tile uses
+    exp2 and rescales the previous numerator and converted-P denominator.
+    """
+
+    sequence = logits_log2.shape[-1]
+    full_sequence = sequence // 128 * 128
+    scores = logits_log2 / 512
+    # Scalars s77/s26 in fwd_hd128_mxfp4.co at 0x19d8/0x19f0.
+    magic = float.fromhex("0x1.ffc4p-4")
+    exp_scale = float.fromhex("0x1.fffep+8")
+    if full_sequence:
+        seed_max = (scores[..., :128] + 1).amax(dim=-1, keepdim=True) - 1
+        shifted = scores[..., :full_sequence] + (magic - seed_max)
+        codes = torch.round(shifted.clamp(0, 1) * 65535).to(torch.int32)
+        if bool((codes > 0x2FFC).any()):
+            raise NotImplementedError("MHA v4 FP6-P overflow rollback is not modeled")
+        raw = (codes << 16).contiguous().view(torch.float32)
+        converted = quantize_mxfp6_e2m3(raw)
+    else:
+        seed_max = scores.amax(dim=-1, keepdim=True)
+        converted = scores[..., :0]
+
+    if full_sequence != sequence:
+        tail = scores[..., full_sequence:]
+        tail_max = torch.maximum(seed_max, tail.amax(dim=-1, keepdim=True))
+        raw_tail = torch.exp2((tail - tail_max) * exp_scale) * 2**-63
+        converted_tail = quantize_mxfp6_e2m3(raw_tail)
+        converted = converted * torch.exp2((seed_max - tail_max) * exp_scale)
+        converted = torch.cat((converted, converted_tail), dim=-1)
+    return converted
 
 
 def _mxfp4_rows(values: torch.Tensor) -> torch.Tensor:
