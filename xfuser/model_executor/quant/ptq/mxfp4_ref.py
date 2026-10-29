@@ -120,3 +120,32 @@ def dequantize_mxfp4(
         rows, columns // MXFP4_BLOCK_SIZE, MXFP4_BLOCK_SIZE
     )
     return (values * decode_e8m0(scales).unsqueeze(-1)).reshape(rows, columns)
+
+
+def quantize_mxfp4_scale_search(
+    values: torch.Tensor,
+    diagonal: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Choose {ceil scale, half scale} per row/block using diagonal MSE.
+
+    Saturation at the E2M1 maximum is intentional for the half-scale arm.
+    The default quantizer and packed artifact format remain unchanged.
+    """
+    packed, scales = quantize_mxfp4(values)
+    rows, columns = values.shape
+    original = values.float().reshape(rows, columns // 32, 32)
+    half_scales = (scales.to(torch.int16) - 1).clamp_min(0).to(torch.uint8)
+    half_codes = _quantize_e2m1_unpacked(original / decode_e8m0(half_scales).unsqueeze(-1))
+    half_packed = pack_fp4(half_codes.reshape(rows, columns))
+    full_values = dequantize_mxfp4(packed, scales).reshape_as(original)
+    half_values = dequantize_mxfp4(half_packed, half_scales).reshape_as(original)
+    if diagonal is None:
+        diagonal = torch.ones(columns, device=values.device)
+    if tuple(diagonal.shape) != (columns,) or not torch.isfinite(diagonal).all() or (diagonal < 0).any():
+        raise ValueError("scale-search diagonal must be finite nonnegative [K]")
+    importance = diagonal.to(device=values.device, dtype=torch.float32).reshape(1, columns // 32, 32)
+    full_loss = ((original-full_values).square()*importance).sum(-1)
+    half_loss = ((original-half_values).square()*importance).sum(-1)
+    use_half = half_loss < full_loss
+    packed = torch.where(use_half.unsqueeze(-1), half_packed.reshape(rows, columns // 32, 16), packed.reshape(rows, columns // 32, 16)).reshape(rows, columns // 2)
+    return packed, torch.where(use_half, half_scales, scales)

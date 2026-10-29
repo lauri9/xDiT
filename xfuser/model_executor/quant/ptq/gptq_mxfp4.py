@@ -6,13 +6,14 @@ from dataclasses import dataclass
 
 import torch
 
-from .mxfp4_ref import dequantize_mxfp4, quantize_mxfp4
+from .mxfp4_ref import dequantize_mxfp4, quantize_mxfp4, quantize_mxfp4_scale_search
 
 
 @dataclass(frozen=True)
 class GPTQConfig:
     percdamp: float = 0.01
     max_cholesky_retries: int = 3
+    scale_search: bool = False
 
 
 @dataclass
@@ -142,7 +143,10 @@ def gptq_quantize_mxfp4(
             group_scale = rtn_scale[:, start // 32 : end // 32]
             group_quantized = rtn[:, start:end].clone()
         else:
-            group_packed, group_scale = quantize_mxfp4(work[:, start:end])
+            if config.scale_search:
+                group_packed, group_scale = quantize_mxfp4_scale_search(work[:, start:end], prepared.raw.diag()[start:end])
+            else:
+                group_packed, group_scale = quantize_mxfp4(work[:, start:end])
             group_quantized = dequantize_mxfp4(group_packed, group_scale)
         group_errors = torch.zeros(
             (out_features, 32),
