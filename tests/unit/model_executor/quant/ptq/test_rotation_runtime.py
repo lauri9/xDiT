@@ -69,3 +69,44 @@ def test_install_rejects_unrotatable_modules():
 
     with pytest.raises(TypeError, match="not a rotatable"):
         install_online_rotations(Holder(), {"ffn_out": make_rotation(64, "wht", block=32)})
+
+
+class PackedLinear(RotatableLinear):
+    """Mimics xFuserMXFP4Linear after load-time packing: weight is None until a
+    full-precision weight is loaded through the state-dict path."""
+
+    def __init__(self, source):
+        super().__init__(source)
+        self.weight_shuffle = torch.nn.Parameter(self.weight.detach().clone(), requires_grad=False)
+        del self.weight
+        self.register_parameter("weight", None)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if prefix + "weight" in state_dict and self.weight is None:
+            del self.weight_shuffle
+            self.weight = torch.nn.Parameter(torch.empty_like(state_dict[prefix + "weight"]))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+
+def test_install_requantizes_packed_layers_from_source_weights():
+    source = torch.nn.Linear(64, 8)
+    original = source.weight.detach().clone()
+
+    class Holder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            inner = torch.nn.Module()
+            inner.ffn = torch.nn.Module()
+            inner.ffn.net = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity(), PackedLinear(source)])
+            self.blocks = torch.nn.ModuleList([inner])
+
+    holder = Holder()
+    rotation = make_rotation(64, "wht", block=32)
+    with pytest.raises(RuntimeError, match="weight_source"):
+        install_online_rotations(holder, {"ffn_out": rotation})
+    install_online_rotations(holder, {"ffn_out": rotation},
+                             weight_source=lambda key: {"blocks.0.ffn.net.2.weight": original}[key])
+    layer = holder.blocks[0].ffn.net[2]
+    assert not hasattr(layer, "weight_shuffle") and layer.input_rotation is rotation
+    x = torch.randn(3, 64)
+    torch.testing.assert_close(layer(x), source(x), atol=1e-5, rtol=1e-5)
