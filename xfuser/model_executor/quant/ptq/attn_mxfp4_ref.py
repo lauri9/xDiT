@@ -40,6 +40,28 @@ def normalized_hadamard_128(values: torch.Tensor) -> torch.Tensor:
     return result * (HEAD_DIM**-0.5)
 
 
+def rotate_qk_operand(values: torch.Tensor, rotation: torch.Tensor | None) -> torch.Tensor:
+    """Apply the Q/K rotation the quantizer sees, in FP32.
+
+    ``None`` is the pinned kernel's normalized WHT-128. Otherwise ``rotation``
+    is an explicit orthogonal ``[128, 128]`` matrix shared by all heads, or
+    ``[heads, 128, 128]``, right-multiplied per head (``x @ R``). Production
+    reaches the same quantized operand by feeding ``x @ (R @ H)`` to MHA v4;
+    that path adds one extra BF16 rounding which this ideal form omits.
+    """
+
+    if rotation is None:
+        return normalized_hadamard_128(values)
+    if values.shape[-1] != HEAD_DIM or rotation.shape[-2:] != (HEAD_DIM, HEAD_DIM):
+        raise ValueError("Q/K rotations are 128 x 128 per head")
+    rotation = rotation.to(device=values.device, dtype=torch.float32)
+    if rotation.ndim == 2:
+        return values.to(torch.float32) @ rotation
+    if rotation.shape[0] != values.shape[-2]:
+        raise ValueError("per-head Q/K rotations must match the head count")
+    return torch.einsum("...hd,hde->...he", values.to(torch.float32), rotation)
+
+
 def quantize_fp6_e3m2(values: torch.Tensor) -> torch.Tensor:
     """Round to finite FP6 E3M2 (historical probe, not pinned MHA v4 P)."""
 
@@ -301,6 +323,7 @@ def mxfp4_attention_ref(
     quantize_v: bool = True,
     quantize_p: bool = True,
     apply_aiter_k_centering: bool = True,
+    qk_rotation: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Emulate dense, non-causal MHA v4 MXFP4 from BF16 BSHD operands."""
 
@@ -320,8 +343,8 @@ def mxfp4_attention_ref(
         if mean is not None:
             centered_key = key.to(torch.float32) - mean.unsqueeze(1)
 
-    rotated_q = normalized_hadamard_128(query) * (scale * MHA_V4_LOG2E)
-    rotated_k = normalized_hadamard_128(centered_key)
+    rotated_q = rotate_qk_operand(query, qk_rotation) * (scale * MHA_V4_LOG2E)
+    rotated_k = rotate_qk_operand(centered_key, qk_rotation)
     # The fused AITER quantizer rounds the rotated values through the input
     # floating-16 type before deriving E8M0 scales.
     rotated_q = rotated_q.to(query.dtype).to(torch.float32)
@@ -345,6 +368,7 @@ def mxfp4_attention_decomposition(
     *,
     query_indices: torch.Tensor,
     softmax_scale: float | None = None,
+    qk_rotation: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate Q-only, K-only, V-only, P-only and full MXFP4 error arms.
 
@@ -360,19 +384,19 @@ def mxfp4_attention_decomposition(
 
     scale = HEAD_DIM**-0.5 if softmax_scale is None else softmax_scale
     sampled_query = query.index_select(1, query_indices.to(query.device))
-    rotated_q = normalized_hadamard_128(sampled_query) * (
+    rotated_q = rotate_qk_operand(sampled_query, qk_rotation) * (
         scale * MHA_V4_LOG2E
     )
     rotated_q = rotated_q.to(query.dtype).to(torch.float32)
     quantized_q = _mxfp4_rows(rotated_q)
 
-    rotated_k = normalized_hadamard_128(key).to(key.dtype).to(torch.float32)
+    rotated_k = rotate_qk_operand(key, qk_rotation).to(key.dtype).to(torch.float32)
     quantized_key_input = key
     mean = aiter_k_mean(key)
     if mean is not None:
         quantized_key_input = key.to(torch.float32) - mean.unsqueeze(1)
     quantized_k = _mxfp4_rows(
-        normalized_hadamard_128(quantized_key_input).to(key.dtype).to(torch.float32)
+        rotate_qk_operand(quantized_key_input, qk_rotation).to(key.dtype).to(torch.float32)
     )
     quantized_v = quantize_mxfp4_v(value)
 

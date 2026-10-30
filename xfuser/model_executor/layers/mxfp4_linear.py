@@ -54,6 +54,9 @@ class xFuserMXFP4Linear(nn.Module):
         
         self.reset_parameters()
         self.mm = self._run_mxfp4_gemm
+        # Opt-in online input rotation (rotation experiments). The weight
+        # must already hold W R; None leaves the GEMM unchanged.
+        self.input_rotation = None
     
     def reset_parameters(self) -> None:
         """Initialize weights using Kaiming uniform (same as nn.Linear)"""
@@ -292,6 +295,9 @@ class xFuserMXFP4Linear(nn.Module):
 
         # Save original shape
         original_shape = input.shape
+
+        if self.input_rotation is not None:
+            input = self.input_rotation.apply(input).to(input.dtype)
         
         # Flatten all batch dimensions: [..., in_features] -> [M, in_features]
         input_2d = input.view(-1, self.in_features)

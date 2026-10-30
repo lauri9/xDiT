@@ -25,6 +25,7 @@ from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     fused_qk_norm_rope,
     _HAS_FLYDSL,
 )
+from xfuser.model_executor.quant.ptq.rotations import apply_head_matrix
 
 env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
@@ -125,6 +126,15 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             # T1 must run while heads are still in canonical order and before
             # USP performs its Ulysses all-to-all/head balancing.
             key = key - attn.k_shift.to(dtype=key.dtype)
+
+        prerotation = getattr(attn, "_xfuser_qk_prerotation", None)
+        if not self.is_cross_attention and prerotation is not None:
+            # Opt-in rotation experiment: MHA v4 MXFP4 fuses a WHT-128 H into
+            # its Q/K quantizers, so feeding Q (R H) makes it quantize Q R.
+            # Heads are still canonical here (before Ulysses), and both Q and
+            # K get the same per-head matrix, so Q K^T is unchanged.
+            query = apply_head_matrix(query, prerotation).to(query.dtype)
+            key = apply_head_matrix(key, prerotation).to(key.dtype)
 
         if self.qkv_observer is not None:
             # Observe the operands that actually enter attention. Calibration
