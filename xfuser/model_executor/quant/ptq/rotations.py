@@ -346,11 +346,15 @@ def fold_qk_signs(weight, bias, signs: torch.Tensor):
 
     Exact through Wan's ``rms_norm_across_heads`` (sign-invariant RMS, diagonal
     affine) and adjacent-pair RoPE when the signs agree within each pair.
+    ``signs`` is ``[128]`` (shared by all heads) or ``[heads, 128]``.
     """
     signs = signs.double().cpu()
-    if signs.shape != (HEAD_DIM,) or not bool((signs[0::2] == signs[1::2]).all()):
+    heads = weight.shape[0] // HEAD_DIM
+    if signs.ndim == 1:
+        signs = signs.expand(heads, -1)
+    if signs.shape != (heads, HEAD_DIM) or not bool((signs[:, 0::2] == signs[:, 1::2]).all()):
         raise ValueError("Q/K sign fold needs 128 signs that agree within RoPE pairs")
-    full = signs.repeat(weight.shape[0] // HEAD_DIM).to(weight.device, torch.float32)
+    full = signs.reshape(-1).to(weight.device, torch.float32)
     return (weight.float() * full.view(-1, 1)).contiguous(), None if bias is None else bias.float() * full
 
 
@@ -359,14 +363,17 @@ def kernel_wht128(device="cpu") -> torch.Tensor:
     return (sylvester_hadamard(HEAD_DIM) / math.sqrt(HEAD_DIM)).to(device=device, dtype=torch.float32)
 
 
-def qk_prerotation(rotation: Rotation | torch.Tensor, device="cpu") -> torch.Tensor:
+def qk_prerotation(rotation: Rotation | list | torch.Tensor, device="cpu") -> torch.Tensor:
     """Matrix ``M = R H`` such that feeding ``Q M`` to MHA v4 quantizes ``Q R``.
 
     ``H`` is symmetric and involutory, so the kernel's fused ``· H`` gives
     ``Q R H H = Q R``. Accepts a 128-wide :class:`Rotation` or a ``[128,128]``
-    / ``[heads,128,128]`` matrix ``R``.
+    / ``[heads,128,128]`` matrix ``R``, or a list of per-head rotations.
     """
-    matrix = rotation.dense(device) if isinstance(rotation, Rotation) else rotation.to(device).float()
+    if isinstance(rotation, list):
+        matrix = torch.stack([r.dense(device) for r in rotation])
+    else:
+        matrix = rotation.dense(device) if isinstance(rotation, Rotation) else rotation.to(device).float()
     if matrix.shape[-2:] != (HEAD_DIM, HEAD_DIM):
         raise ValueError("Q/K rotations are 128 × 128 per head")
     return matrix @ kernel_wht128(device)

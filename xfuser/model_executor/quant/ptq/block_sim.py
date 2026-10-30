@@ -121,12 +121,13 @@ class RotationPlan:
     """Which rotation each site uses. ``None`` keeps production behaviour.
 
     ``qk`` is the 128-wide rotation the MXFP4 attention quantizer should see.
+    A list gives one rotation per head.
     ``qk_mode="prerotate"`` feeds ``Q (R H)`` to the kernel; ``"fold_signs"``
     requires ``qk`` to be a WHT-128 with pair-equal signs and folds them into
     ``to_q``/``to_k`` (no runtime op).
     """
 
-    qk: Rotation | torch.Tensor | None = None
+    qk: Rotation | list | torch.Tensor | None = None
     qk_mode: str = "prerotate"
     self_vo: Rotation | list | None = None
     cross_vo: Rotation | list | None = None
@@ -194,12 +195,17 @@ def prepare_block(params: dict[str, torch.Tensor], plan: RotationPlan | None) ->
     prerotation = None
     if plan.qk is not None:
         if plan.qk_mode == "fold_signs":
-            if not isinstance(plan.qk, Rotation) or plan.qk.kind != "wht" or plan.qk.block != HEAD_DIM \
-                    or plan.qk.signs is None or plan.qk.perm is not None:
-                raise ValueError("fold_signs needs a signed WHT-128 rotation")
+            rotations = plan.qk if isinstance(plan.qk, list) else [plan.qk]
+            for rotation in rotations:
+                if not isinstance(rotation, Rotation) or rotation.kind != "wht" or rotation.block != HEAD_DIM \
+                        or rotation.perm is not None:
+                    raise ValueError("fold_signs needs signed WHT-128 rotations")
+            signs = torch.stack([torch.ones(HEAD_DIM, dtype=torch.float64) if r.signs is None else r.signs
+                                 for r in rotations])
+            signs = signs[0] if len(rotations) == 1 else signs
             for name in ("attn1.to_q", "attn1.to_k"):
                 out[f"{name}.weight"], out[f"{name}.bias"] = fold_qk_signs(
-                    out[f"{name}.weight"], out[f"{name}.bias"], plan.qk.signs)
+                    out[f"{name}.weight"], out[f"{name}.bias"], signs)
         elif plan.qk_mode == "prerotate":
             prerotation = qk_prerotation(plan.qk, "cpu")
         else:

@@ -92,6 +92,21 @@ def test_identity_prerotation_turns_off_the_kernel_rotation():
     assert not torch.equal(taps_none["self_attn"], taps_prod["self_attn"])
 
 
+def test_per_head_sign_fold_matches_per_head_prerotation():
+    params, inputs = _params(), _inputs(torch.bfloat16)
+    config = BlockConfig.uniform("bf16", "mxfp4", attention_impl="reference")
+    rotations = [make_rotation(HEAD_DIM, "wht", sign_seed=s, sign_pairs=True) for s in (1, 2)]
+    taps_fold, taps_pre = {}, {}
+    WanBlockSim(prepare_block(params, RotationPlan(qk=rotations, qk_mode="fold_signs")), config,
+                heads=HEADS).forward(*inputs, taps=taps_fold)
+    WanBlockSim(prepare_block(params, RotationPlan(qk=rotations)), config, heads=HEADS).forward(*inputs, taps=taps_pre)
+    torch.testing.assert_close(taps_fold["self_attn"], taps_pre["self_attn"], atol=0.05, rtol=0)
+    # Per-head signs differ, so heads are not all flipped identically.
+    folded = prepare_block(params, RotationPlan(qk=rotations, qk_mode="fold_signs")).params["attn1.to_q.weight"]
+    head_signs = torch.sign(folded[:, 0] / params["attn1.to_q.weight"][:, 0]).reshape(HEADS, HEAD_DIM)
+    assert torch.equal(head_signs[0].double(), rotations[0].signs) and torch.equal(head_signs[1].double(), rotations[1].signs)
+
+
 def test_emulated_gemm_modes_and_overrides():
     params, inputs = _params(), _inputs(torch.bfloat16)
     weight_only = BlockConfig({g: GemmSetting("emulated", quant_act=False) for g in
