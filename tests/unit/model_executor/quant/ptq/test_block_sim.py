@@ -121,6 +121,15 @@ def test_emulated_gemm_modes_and_overrides():
     sim.forward(*inputs)
 
 
+def test_taps_cover_every_gemm_input():
+    params, inputs = _params(), _inputs()
+    taps = {}
+    WanBlockSim(prepare_block(params, None), BlockConfig.uniform("bf16", "bf16", attention_impl="reference"),
+                heads=HEADS).forward(*inputs, taps=taps)
+    assert {"self_qkv_in", "self_attn", "cross_q_in", "cross_attn", "ffn_in_in", "ffn_out_in"} <= set(taps)
+    assert taps["ffn_out_in"].shape[-1] == FFN and taps["cross_attn"].shape[-1] == DIM
+
+
 def test_fake_quant_chunking_matches_unchunked():
     x = torch.randn(70, 64)
     torch.testing.assert_close(fake_quant_mxfp4(x, chunk_rows=16), dequantize_mxfp4(*quantize_mxfp4(x)))

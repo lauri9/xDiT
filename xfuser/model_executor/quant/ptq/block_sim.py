@@ -319,8 +319,9 @@ class WanBlockSim:
         """Run the block. ``taps``, when given, receives intermediate tensors;
         restrict them with ``taps["_want"] = {...}`` (default: all). Keys:
         ``self_qkv_in``, ``q``/``k``/``v`` (post-RoPE, before any pre-rotation),
-        ``self_attn``, ``cross_q_in``, ``ffn_in_in``, ``ffn_out_in`` (GELU
-        output). GEMM inputs are tapped before online rotations."""
+        ``self_attn``, ``cross_q_in``, ``cross_attn``, ``ffn_in_in``,
+        ``ffn_out_in`` (GELU output). GEMM inputs are tapped before online
+        rotations."""
 
         def tap(key, value):
             if taps is not None and (taps.get("_want") is None or key in taps["_want"]):
@@ -364,6 +365,7 @@ class WanBlockSim:
         key = self._rms("attn2.norm_k.weight", key).unflatten(2, (self.heads, -1))
         value = value.unflatten(2, (self.heads, -1))
         attended = self.attention(query, key, value, quantized=False).flatten(2, 3).to(dtype)
+        tap("cross_attn", attended)
         hidden = hidden + self.linear("cross_out", "attn2.to_out.0", self.group_input("cross_out", attended))
 
         # 3. feed-forward
