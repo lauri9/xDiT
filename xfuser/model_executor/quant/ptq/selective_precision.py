@@ -39,6 +39,46 @@ def checkpoint_weight_source(component: str, device="cuda") -> Callable[[str], t
     return lambda key: _read_weight(weight_map, key, device).to(torch.bfloat16)
 
 
+def artifact_weight_source(artifact_root, component: str, device="cuda") -> Callable[[str], torch.Tensor]:
+    """``key -> BF16`` reader taking ``.weight`` tensors from a GPTQ artifact.
+
+    Weights are the artifact's dequantized MXFP4 values (exactly on the MXFP4
+    grid and exactly representable in BF16); biases and anything the artifact
+    does not cover come from the pinned checkpoint. The artifact is fully
+    validated (revision, shard hashes, shapes) before use.
+    """
+    from safetensors import safe_open
+
+    from .artifact import load_artifact
+    from .calibrate import MODEL_REVISION
+    from .mxfp4_ref import dequantize_mxfp4
+
+    artifact = load_artifact(artifact_root, expected_source_revision=MODEL_REVISION)
+    layers = artifact.config["layers"]
+    checkpoint = checkpoint_weight_source(component, device)
+
+    def read(key: str) -> torch.Tensor:
+        name, _, kind = key.rpartition(".")
+        entry = layers.get(f"{component}.{name}")
+        if kind != "weight" or entry is None:
+            if kind == "weight":
+                raise KeyError(f"artifact {artifact.artifact_id} does not cover {component}.{name}")
+            return checkpoint(key)
+        with safe_open(artifact.root / entry["shard"], framework="pt", device="cpu") as handle:
+            packed = handle.get_tensor(entry["packed_key"])
+            scale = handle.get_tensor(entry["scale_key"])
+        values = dequantize_mxfp4(packed.to(device), scale.to(device))
+        if tuple(values.shape) != tuple(entry["weight_shape"]):
+            raise ValueError(f"artifact weight shape mismatch for {name}")
+        weight = values.to(torch.bfloat16)
+        if not torch.equal(weight.float(), values):
+            raise ValueError(f"artifact weight for {name} is not exactly representable in BF16")
+        return weight
+
+    read.artifact_id = artifact.artifact_id
+    return read
+
+
 def _replace(root: torch.nn.Module, name: str, module: torch.nn.Module) -> None:
     parent_name, _, child = name.rpartition(".")
     parent = root.get_submodule(parent_name) if parent_name else root

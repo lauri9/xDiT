@@ -90,9 +90,23 @@ class KernelGemm:
         return out.view(*values.shape[:-1], -1)
 
 
+class A6W4Gemm:
+    """The production ``xFuserA6W4Linear`` path (MXFP6 activations, MXFP4 weights)."""
+
+    def __init__(self, weight: torch.Tensor):
+        from xfuser.model_executor.layers.mixed_mxfp_linear import xFuserA6W4Linear
+
+        self.layer = xFuserA6W4Linear(weight.shape[1], weight.shape[0], bias=False, device="meta",
+                                      dtype=torch.bfloat16)
+        self.layer.load_and_quantize_weights(weight.to(torch.bfloat16).contiguous(), None, device=weight.device)
+
+    def __call__(self, values: torch.Tensor) -> torch.Tensor:
+        return self.layer(values)
+
+
 @dataclass
 class GemmSetting:
-    mode: str = "bf16"  # bf16 | emulated | kernel
+    mode: str = "bf16"  # bf16 | emulated | kernel (A4W4) | a6w4 (kernel)
     quant_act: bool = True  # emulated only
     quant_weight: bool = True  # emulated only
 
@@ -242,14 +256,16 @@ class WanBlockSim:
         self._norms = {}
         for group, linears in GEMM_GROUPS.items():
             setting = config.gemm(group)
-            if setting.mode not in ("bf16", "emulated", "kernel"):
+            if setting.mode not in ("bf16", "emulated", "kernel", "a6w4"):
                 raise ValueError(f"unknown GEMM mode {setting.mode!r}")
             for name in linears:
                 weight = self.p[f"{name}.weight"].to(torch.bfloat16)
-                if setting.mode == "kernel":
-                    if name in self.overrides:
-                        raise ValueError("weight overrides are emulated-mode only")
-                    self._kernels[name] = KernelGemm(weight)
+                if setting.mode in ("kernel", "a6w4"):
+                    # Overrides for kernel modes must already lie on the MXFP4
+                    # grid (e.g. dequantized GPTQ weights); the kernel packer
+                    # then reproduces their codes (accelerator-tested).
+                    source = self.overrides[name].to(torch.bfloat16) if name in self.overrides else weight
+                    self._kernels[name] = KernelGemm(source) if setting.mode == "kernel" else A6W4Gemm(source)
                 elif setting.mode == "emulated" and setting.quant_weight:
                     self._fq_weights[name] = (self.overrides[name].float() if name in self.overrides
                                               else fake_quant_mxfp4(weight))
@@ -261,7 +277,7 @@ class WanBlockSim:
         folded FP32 weights are stored BF16 exactly as an artifact would be)."""
         setting = self.config.gemm(group)
         bias = self.p[f"{name}.bias"].to(values.dtype)
-        if setting.mode == "kernel":
+        if setting.mode in ("kernel", "a6w4"):
             return self._kernels[name](values) + bias
         weight = self.p[f"{name}.weight"].to(values.dtype)
         if setting.mode == "bf16":
