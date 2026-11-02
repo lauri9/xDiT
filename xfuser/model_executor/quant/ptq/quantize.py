@@ -54,13 +54,28 @@ def quantize_calibration(
     blocks: tuple[int, ...],
     groups: frozenset[str] | None,
     config: GPTQConfig,
+    weight_domain: str = "identity",
 ) -> Path:
+    """GPTQ every selected linear from saved Hessians into an artifact.
+
+    ``weight_domain="a6w4_h32"`` quantizes the weight AITER's A6W4 kernel
+    actually uses, ``bf16(W H)``, against the conjugated Hessian ``Hᵀ H H``
+    (H = the kernel's BF16 32x32 Hadamard). Its codes are in the rotated
+    domain and load only through ``a6w4_weights.install_a6w4_codes``.
+    """
+    if weight_domain not in ("identity", "a6w4_h32"):
+        raise ValueError(f"unknown weight domain {weight_domain!r}")
     record = json.loads((calibration_dir / "calib_record.json").read_text(encoding="utf-8"))
     settings = record["settings"]
     model = settings["model"]
     revision = settings["model_revision"]
     calib_id = record["calib_id"]
     device = f"cuda:{torch.cuda.current_device()}"
+    h32 = None
+    if weight_domain == "a6w4_h32":
+        from .a6w4_weights import conjugate_hessian, kernel_h32, rotated_weight
+
+        h32 = kernel_h32(device)
     linears: dict[str, QuantizedLinear] = {}
     reports = []
 
@@ -81,6 +96,8 @@ def quantize_calibration(
                 if hessian_cpu is None:
                     raise KeyError(f"calibration has no Hessian {component}.{group.name}")
                 hessian = hessian_cpu.to(device)
+                if h32 is not None:
+                    hessian = conjugate_hessian(hessian, h32)
                 prepared = prepare_hessian(hessian, config)
                 for module_name in group.linears:
                     started_at = time.perf_counter()
@@ -90,6 +107,8 @@ def quantize_calibration(
                         f"{module_name}.weight",
                         device,
                     )
+                    if h32 is not None:
+                        weight = rotated_weight(weight.to(torch.bfloat16))
                     result = gptq_quantize_mxfp4(
                         weight,
                         hessian,
@@ -122,6 +141,8 @@ def quantize_calibration(
     }
     if config.scale_search:
         gptq_payload["scale_search"] = True
+    if weight_domain != "identity":
+        gptq_payload["weight_domain"] = weight_domain
     digest = config_hash(gptq_payload)[:12]
     artifact_id = (
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{digest}"
@@ -151,6 +172,7 @@ def _parse_args():
     parser.add_argument("--percdamp", type=float, default=0.01)
     parser.add_argument("--max-cholesky-retries", type=int, default=3)
     parser.add_argument("--scale-search", action="store_true")
+    parser.add_argument("--weight-domain", choices=("identity", "a6w4_h32"), default="identity")
     args = parser.parse_args()
     return args
 
@@ -173,5 +195,6 @@ if __name__ == "__main__":
                 max_cholesky_retries=cli.max_cholesky_retries,
                 scale_search=cli.scale_search,
             ),
+            weight_domain=cli.weight_domain,
         )
     )

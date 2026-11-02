@@ -93,12 +93,22 @@ class KernelGemm:
 class A6W4Gemm:
     """The production ``xFuserA6W4Linear`` path (MXFP6 activations, MXFP4 weights)."""
 
-    def __init__(self, weight: torch.Tensor):
+    def __init__(self, weight: torch.Tensor | None, *, codes=None):
+        """Pack ``weight`` with AITER's rotating packer (A6W4 RTN), or install
+        rotated-domain ``codes=(packed [R,K/2], scale [R,K/32])`` directly."""
         from xfuser.model_executor.layers.mixed_mxfp_linear import xFuserA6W4Linear
 
-        self.layer = xFuserA6W4Linear(weight.shape[1], weight.shape[0], bias=False, device="meta",
-                                      dtype=torch.bfloat16)
-        self.layer.load_and_quantize_weights(weight.to(torch.bfloat16).contiguous(), None, device=weight.device)
+        if codes is not None:
+            from .a6w4_weights import load_packed, pack_codes
+
+            packed, scale = codes
+            self.layer = xFuserA6W4Linear(packed.shape[1] * 2, packed.shape[0], bias=False, device="meta",
+                                          dtype=torch.bfloat16)
+            load_packed(self.layer, *pack_codes(packed, scale), None)
+        else:
+            self.layer = xFuserA6W4Linear(weight.shape[1], weight.shape[0], bias=False, device="meta",
+                                          dtype=torch.bfloat16)
+            self.layer.load_and_quantize_weights(weight.to(torch.bfloat16).contiguous(), None, device=weight.device)
 
     def __call__(self, values: torch.Tensor) -> torch.Tensor:
         return self.layer(values)
@@ -243,7 +253,8 @@ def _rope(values: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 class WanBlockSim:
     def __init__(self, prepared: PreparedBlock, config: BlockConfig, *, heads: int = 40,
-                 weight_overrides: dict[str, torch.Tensor] | None = None):
+                 weight_overrides: dict[str, torch.Tensor] | None = None,
+                 a6w4_codes: dict[str, tuple] | None = None):
         self.config = config
         self.heads = heads
         self.online = prepared.online
@@ -251,6 +262,7 @@ class WanBlockSim:
         self.p = {name: value for name, value in prepared.params.items()}
         self.prerotation = prepared.qk_prerotation
         self.overrides = weight_overrides or {}
+        self.a6w4_codes = a6w4_codes or {}
         self._kernels: dict[str, KernelGemm] = {}
         self._fq_weights: dict[str, torch.Tensor] = {}
         self._norms = {}
@@ -264,8 +276,15 @@ class WanBlockSim:
                     # Overrides for kernel modes must already lie on the MXFP4
                     # grid (e.g. dequantized GPTQ weights); the kernel packer
                     # then reproduces their codes (accelerator-tested).
-                    source = self.overrides[name].to(torch.bfloat16) if name in self.overrides else weight
-                    self._kernels[name] = KernelGemm(source) if setting.mode == "kernel" else A6W4Gemm(source)
+                    if setting.mode == "a6w4" and name in self.a6w4_codes:
+                        self._kernels[name] = A6W4Gemm(None, codes=self.a6w4_codes[name])
+                    elif setting.mode == "a6w4":
+                        if name in self.overrides:
+                            raise ValueError("A6W4 re-rotates dense weights; pass rotated codes via a6w4_codes")
+                        self._kernels[name] = A6W4Gemm(weight)
+                    else:
+                        source = self.overrides[name].to(torch.bfloat16) if name in self.overrides else weight
+                        self._kernels[name] = KernelGemm(source)
                 elif setting.mode == "emulated" and setting.quant_weight:
                     self._fq_weights[name] = (self.overrides[name].float() if name in self.overrides
                                               else fake_quant_mxfp4(weight))

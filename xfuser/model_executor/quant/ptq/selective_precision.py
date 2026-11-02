@@ -54,6 +54,9 @@ def artifact_weight_source(artifact_root, component: str, device="cuda") -> Call
     from .mxfp4_ref import dequantize_mxfp4
 
     artifact = load_artifact(artifact_root, expected_source_revision=MODEL_REVISION)
+    domain = artifact.config.get("gptq_config", {}).get("weight_domain", "identity")
+    if domain != "identity":
+        raise ValueError(f"artifact {artifact.artifact_id} holds {domain!r}-domain codes; use a6w4_weights")
     layers = artifact.config["layers"]
     checkpoint = checkpoint_weight_source(component, device)
 
