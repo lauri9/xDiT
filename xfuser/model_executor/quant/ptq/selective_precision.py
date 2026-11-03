@@ -92,6 +92,48 @@ def _replace(root: torch.nn.Module, name: str, module: torch.nn.Module) -> None:
 
 
 @torch.no_grad()
+def repack_mxfp4_weights(
+    transformer,
+    groups,
+    *,
+    weight_source: Callable[[str], torch.Tensor],
+    blocks=None,
+    layer_type=None,
+) -> list[str]:
+    """Re-pack existing A4W4 (``xFuserMXFP4Linear``) linears from ``weight_source``.
+
+    Installs identity-domain GPTQ weights after a production RTN load, in
+    place, through the layer's own AITER packer. The prepacked-artifact loader
+    is single-rank only; this works on every rank of a data-parallel run.
+    GPTQ values lie on the MXFP4 grid, so the packer reproduces them exactly.
+    Biases are untouched. Returns the re-packed module names.
+    """
+    unknown = set(groups) - set(GROUP_LINEARS)
+    if unknown or not groups:
+        raise ValueError(f"unknown or empty GEMM groups: {sorted(unknown) or groups}")
+    if layer_type is None:
+        from xfuser.model_executor.layers.mxfp4_linear import xFuserMXFP4Linear as layer_type
+    repacked = []
+    for index in range(len(transformer.blocks)) if blocks is None else blocks:
+        for group in groups:
+            for local in GROUP_LINEARS[group]:
+                name = f"blocks.{index}.{local}"
+                layer = transformer.get_submodule(name)
+                if not isinstance(layer, layer_type):
+                    raise RuntimeError(f"{name} is {type(layer).__name__}, not {layer_type.__name__}")
+                if getattr(layer, "input_rotation", None) is not None:
+                    raise RuntimeError(f"{name} carries an input rotation; not combined here")
+                weight = weight_source(f"{name}.weight").to(torch.bfloat16)
+                if tuple(weight.shape) != (layer.out_features, layer.in_features):
+                    raise ValueError(f"{name} weight shape mismatch")
+                device = layer.weight_shuffle.device
+                layer.load_and_quantize_weights(weight.to(device))
+                repacked.append(name)
+                del weight
+    return repacked
+
+
+@torch.no_grad()
 def install_selective_precision(
     transformer,
     groups,
