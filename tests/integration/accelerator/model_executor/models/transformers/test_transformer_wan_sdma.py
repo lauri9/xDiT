@@ -2,7 +2,8 @@
 
 import pytest
 
-pytestmark = [pytest.mark.multi_gpu, pytest.mark.rocm]
+# The SDMA transport keeps peer groups per process; reused ranks would get stale ones.
+pytestmark = [pytest.mark.multi_gpu, pytest.mark.rocm, pytest.mark.fresh_ranks]
 
 
 def _setup(rank, world_size, init_method):

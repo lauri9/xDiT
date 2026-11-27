@@ -2,7 +2,8 @@
 
 import pytest
 
-pytestmark = [pytest.mark.multi_gpu, pytest.mark.rocm]
+# The SDMA transport keeps peer groups per process; reused ranks would get stale ones.
+pytestmark = [pytest.mark.multi_gpu, pytest.mark.rocm, pytest.mark.fresh_ranks]
 
 # The backend the SDMA path runs with in production. SDPA, reading the bshd inbox views
 # directly, has given rare run-to-run differences under heavy neighbour traffic even though

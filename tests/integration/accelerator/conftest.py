@@ -2,9 +2,18 @@ from pathlib import Path
 
 import pytest
 
-from _spawn import spawn_accelerator_ranks
+import _spawn
+from _spawn import close_pool, pool_starts, spawn_accelerator_ranks
 
 _ACCELERATOR_ROOT = Path(__file__).resolve().parent
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ranks(request):
+    """Tell ``_spawn`` to use new rank processes for a test with the ``fresh_ranks`` marker."""
+    _spawn.fresh_ranks = request.node.get_closest_marker("fresh_ranks") is not None
+    yield
+    _spawn.fresh_ranks = False
 
 
 @pytest.fixture
@@ -36,3 +45,10 @@ def pytest_collection_modifyitems(items):
         path = Path(str(item.path)).resolve()
         if path == _ACCELERATOR_ROOT or _ACCELERATOR_ROOT in path.parents:
             item.add_marker(accelerator)
+
+
+def pytest_sessionfinish(session):
+    """Stop the rank pool that ``XFUSER_TEST_RANK_POOL=1`` starts."""
+    if pool_starts():
+        print(f"\nrank pool: started {pool_starts()} time(s)")
+    close_pool()
